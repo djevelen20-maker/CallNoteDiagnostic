@@ -2,6 +2,7 @@ package com.callnote.diagnostic
 
 import android.Manifest
 import android.media.AudioManager
+import android.media.MediaPlayer
 import android.os.Build
 import android.os.Bundle
 import android.telephony.TelephonyManager
@@ -17,41 +18,53 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 class MainActivity : ComponentActivity() {
+    private var player: MediaPlayer? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.READ_PHONE_STATE), 10)
 
         setContent {
-            var result by remember { mutableStateOf("Готов к тесту") }
+            var result by remember { mutableStateOf("Готово") }
+            var selectedFile by remember { mutableStateOf<File?>(null) }
 
             MaterialTheme {
                 Column(Modifier.fillMaxSize().padding(20.dp)) {
-                    Text("CallNote Diagnostic v0.8")
-                    Text("\nЗаписи звонков")
-
-                    Button(onClick = {
-                        val phone = getSystemService(TELEPHONY_SERVICE) as TelephonyManager
-                        val audio = getSystemService(AUDIO_SERVICE) as AudioManager
-                        result = "Модель: ${Build.MANUFACTURER} ${Build.MODEL}\nAndroid: ${Build.VERSION.RELEASE}\nAudio: ${audio.mode}\nСостояние: ${phone.callState}"
-                    }) {
-                        Text("Проверить звонок")
-                    }
+                    Text("CallNote Diagnostic v0.9")
+                    Text("\nАудио записи звонков")
 
                     Button(onClick = {
                         val dir = getExternalFilesDir(null)
                         val files = dir?.listFiles()?.filter { it.name.endsWith(".m4a") }
-                        result = if (files.isNullOrEmpty()) {
-                            "Записей пока нет"
-                        } else {
-                            files.joinToString("\n") { "${it.name} (${it.length()/1024} KB)" }
+                        selectedFile = files?.firstOrNull()
+                        result = if (files.isNullOrEmpty()) "Записей нет" else "Найдено записей: ${files.size}"
+                    }) {
+                        Text("Обновить список")
+                    }
+
+                    Button(onClick = {
+                        try {
+                            player?.release()
+                            player = MediaPlayer().apply {
+                                setDataSource(selectedFile?.absolutePath)
+                                prepare()
+                                start()
+                            }
+                            result = "Воспроизведение: ${selectedFile?.name}"
+                        } catch (e: Exception) {
+                            result = "Выберите запись"
                         }
                     }) {
-                        Text("Список записей")
+                        Text("Прослушать")
+                    }
+
+                    Button(onClick = {
+                        selectedFile?.delete()
+                        result = "Запись удалена"
+                    }) {
+                        Text("Удалить запись")
                     }
 
                     Text("\n$result")
