@@ -13,7 +13,12 @@ class CallReceiver : BroadcastReceiver() {
             when (state) {
                 TelephonyManager.EXTRA_STATE_OFFHOOK -> {
                     val service = Intent(context, CallMonitorService::class.java)
-                    context.startService(service)
+                    context.startForegroundService(service)
+                }
+
+                TelephonyManager.EXTRA_STATE_IDLE -> {
+                    val service = Intent(context, CallMonitorService::class.java)
+                    context.stopService(service)
                 }
             }
         }
