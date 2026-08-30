@@ -2,6 +2,7 @@ package com.callnote.diagnostic
 
 import android.Manifest
 import android.media.AudioManager
+import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.Bundle
@@ -20,11 +21,11 @@ import java.io.File
 
 class MainActivity : ComponentActivity() {
     private var recorder: MediaRecorder? = null
+    private var player: MediaPlayer? = null
     private var file: File? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
         requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 10)
 
         setContent {
@@ -32,11 +33,9 @@ class MainActivity : ComponentActivity() {
             var recording by remember { mutableStateOf(false) }
 
             MaterialTheme {
-                Column(
-                    modifier = Modifier.fillMaxSize().padding(20.dp)
-                ) {
-                    Text("CallNote Diagnostic v0.3")
-                    Text("\nHuawei / Android тест")
+                Column(Modifier.fillMaxSize().padding(20.dp)) {
+                    Text("CallNote Diagnostic v0.4")
+                    Text("\nТест аудио и записи")
 
                     Button(onClick = {
                         val audio = getSystemService(AUDIO_SERVICE) as AudioManager
@@ -46,7 +45,7 @@ Android: ${Build.VERSION.RELEASE}
 SDK: ${Build.VERSION.SDK_INT}
 Audio mode: ${audio.mode}
 
-Микрофон доступен: да
+Готовность микрофона: да
 """.trimIndent()
                     }) {
                         Text("Проверить устройство")
@@ -54,31 +53,42 @@ Audio mode: ${audio.mode}
 
                     Button(onClick = {
                         if (!recording) {
-                            try {
-                                file = File(getExternalFilesDir(null), "test_audio.m4a")
-                                recorder = MediaRecorder(this@MainActivity).apply {
-                                    setAudioSource(MediaRecorder.AudioSource.MIC)
-                                    setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                                    setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                                    setOutputFile(file)
-                                    prepare()
-                                    start()
-                                }
-                                recording = true
-                                result = "Идёт запись микрофона..."
-                            } catch (e: Exception) {
-                                result = "Ошибка: ${e.message}"
+                            file = File(getExternalFilesDir(null), "CallNote_test.m4a")
+                            recorder = MediaRecorder(this@MainActivity).apply {
+                                setAudioSource(MediaRecorder.AudioSource.MIC)
+                                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                                setOutputFile(file)
+                                prepare()
+                                start()
                             }
+                            recording = true
+                            result = "Идёт запись..."
                         } else {
                             recorder?.stop()
                             recorder?.release()
                             recorder = null
                             recording = false
-                            result = "Запись сохранена:\n${file?.absolutePath}"
+                            result = "Файл сохранён:\n${file?.name}"
                         }
                     }) {
-                        Text(if (recording) "Остановить запись" else "Записать аудио"
-                    )
+                        Text(if (recording) "Остановить" else "Записать заметку")
+                    }
+
+                    Button(onClick = {
+                        try {
+                            player?.release()
+                            player = MediaPlayer().apply {
+                                setDataSource(file?.absolutePath)
+                                prepare()
+                                start()
+                            }
+                            result = "Воспроизведение записи"
+                        } catch (e: Exception) {
+                            result = "Сначала сделайте запись"
+                        }
+                    }) {
+                        Text("Прослушать запись")
                     }
 
                     Text("\n$result")
