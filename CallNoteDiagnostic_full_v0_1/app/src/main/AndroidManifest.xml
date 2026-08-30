@@ -3,9 +3,16 @@
 <uses-permission android:name="android.permission.RECORD_AUDIO"/>
 <uses-permission android:name="android.permission.READ_PHONE_STATE"/>
 <uses-permission android:name="android.permission.READ_CALL_LOG"/>
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
 
 <application android:label="CallNote Diagnostic">
     <service android:name=".CallMonitorService" android:exported="false" />
+
+    <receiver android:name=".CallReceiver" android:exported="false">
+        <intent-filter>
+            <action android:name="android.intent.action.PHONE_STATE" />
+        </intent-filter>
+    </receiver>
 
     <activity android:name=".MainActivity" android:exported="true">
         <intent-filter>
