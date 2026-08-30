@@ -5,6 +5,8 @@
 <uses-permission android:name="android.permission.READ_CALL_LOG"/>
 
 <application android:label="CallNote Diagnostic">
+    <service android:name=".CallMonitorService" android:exported="false" />
+
     <activity android:name=".MainActivity" android:exported="true">
         <intent-filter>
             <action android:name="android.intent.action.MAIN"/>
