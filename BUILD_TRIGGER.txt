@@ -1,2 +1,3 @@
 Trigger automatic APK build via GitHub Actions.
 CallNote AI build check.
+Fix compose compiler plugin configuration applied.
