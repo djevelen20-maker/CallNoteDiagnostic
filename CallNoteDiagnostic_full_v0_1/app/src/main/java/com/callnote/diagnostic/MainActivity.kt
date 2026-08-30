@@ -34,8 +34,8 @@ class MainActivity : ComponentActivity() {
 
             MaterialTheme {
                 Column(Modifier.fillMaxSize().padding(20.dp)) {
-                    Text("CallNote Diagnostic v0.4")
-                    Text("\nТест аудио и записи")
+                    Text("CallNote Diagnostic v0.5")
+                    Text("\nТест записи звонков")
 
                     Button(onClick = {
                         val audio = getSystemService(AUDIO_SERVICE) as AudioManager
@@ -45,17 +45,22 @@ Android: ${Build.VERSION.RELEASE}
 SDK: ${Build.VERSION.SDK_INT}
 Audio mode: ${audio.mode}
 
-Готовность микрофона: да
+Проверяемые каналы:
+MIC — доступен
+VOICE_CALL — тестовый режим
+VOICE_COMMUNICATION — тестовый режим
+VOICE_DOWNLINK — тестовый режим
+VOICE_UPLINK — тестовый режим
 """.trimIndent()
                     }) {
-                        Text("Проверить устройство")
+                        Text("Проверить аудиоканалы")
                     }
 
                     Button(onClick = {
                         if (!recording) {
-                            file = File(getExternalFilesDir(null), "CallNote_test.m4a")
+                            file = File(getExternalFilesDir(null), "CallNote_call_test.m4a")
                             recorder = MediaRecorder(this@MainActivity).apply {
-                                setAudioSource(MediaRecorder.AudioSource.MIC)
+                                setAudioSource(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
                                 setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
                                 setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
                                 setOutputFile(file)
@@ -63,16 +68,16 @@ Audio mode: ${audio.mode}
                                 start()
                             }
                             recording = true
-                            result = "Идёт запись..."
+                            result = "Тест аудиоканала звонка запущен"
                         } else {
                             recorder?.stop()
                             recorder?.release()
                             recorder = null
                             recording = false
-                            result = "Файл сохранён:\n${file?.name}"
+                            result = "Тест завершён:\n${file?.name}"
                         }
                     }) {
-                        Text(if (recording) "Остановить" else "Записать заметку")
+                        Text(if (recording) "Остановить тест звонка" else "Тест записи звонка")
                     }
 
                     Button(onClick = {
@@ -83,12 +88,12 @@ Audio mode: ${audio.mode}
                                 prepare()
                                 start()
                             }
-                            result = "Воспроизведение записи"
+                            result = "Прослушивание теста"
                         } catch (e: Exception) {
-                            result = "Сначала сделайте запись"
+                            result = "Нет записи теста"
                         }
                     }) {
-                        Text("Прослушать запись")
+                        Text("Прослушать тест")
                     }
 
                     Text("\n$result")
