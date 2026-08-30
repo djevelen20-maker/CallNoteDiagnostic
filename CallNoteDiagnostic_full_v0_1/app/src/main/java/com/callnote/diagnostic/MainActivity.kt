@@ -1,11 +1,8 @@
 package com.callnote.diagnostic
 
 import android.Manifest
-import android.media.AudioManager
 import android.media.MediaPlayer
-import android.os.Build
 import android.os.Bundle
-import android.telephony.TelephonyManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Column
@@ -24,7 +21,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.READ_PHONE_STATE), 10)
+        requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 10)
 
         setContent {
             var result by remember { mutableStateOf("Готово") }
@@ -32,16 +29,23 @@ class MainActivity : ComponentActivity() {
 
             MaterialTheme {
                 Column(Modifier.fillMaxSize().padding(20.dp)) {
-                    Text("CallNote Diagnostic v0.9")
-                    Text("\nАудио записи звонков")
+                    Text("CallNote AI v1.0")
+                    Text("\nАудио → Текст → AI анализ")
 
                     Button(onClick = {
-                        val dir = getExternalFilesDir(null)
-                        val files = dir?.listFiles()?.filter { it.name.endsWith(".m4a") }
+                        val files = getExternalFilesDir(null)?.listFiles()?.filter { it.name.endsWith(".m4a") }
                         selectedFile = files?.firstOrNull()
-                        result = if (files.isNullOrEmpty()) "Записей нет" else "Найдено записей: ${files.size}"
+                        result = if (selectedFile == null) "Записей нет" else "Выбрано: ${selectedFile?.name}"
                     }) {
-                        Text("Обновить список")
+                        Text("Выбрать запись")
+                    }
+
+                    Button(onClick = {
+                        result = selectedFile?.let {
+                            "Отправка в Whisper для расшифровки: ${it.name}"
+                        } ?: "Сначала выберите запись"
+                    }) {
+                        Text("Расшифровать")
                     }
 
                     Button(onClick = {
@@ -52,19 +56,12 @@ class MainActivity : ComponentActivity() {
                                 prepare()
                                 start()
                             }
-                            result = "Воспроизведение: ${selectedFile?.name}"
+                            result = "Прослушивание"
                         } catch (e: Exception) {
-                            result = "Выберите запись"
+                            result = "Нет записи"
                         }
                     }) {
                         Text("Прослушать")
-                    }
-
-                    Button(onClick = {
-                        selectedFile?.delete()
-                        result = "Запись удалена"
-                    }) {
-                        Text("Удалить запись")
                     }
 
                     Text("\n$result")
