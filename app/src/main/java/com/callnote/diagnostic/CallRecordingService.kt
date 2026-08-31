@@ -37,22 +37,13 @@ class CallRecordingService : Service() {
         if (recorder != null) return
         val directory = File(getExternalFilesDir(Environment.DIRECTORY_MUSIC), "CallNoteAI").apply { mkdirs() }
         val file = File(directory, "callnote_call_${timestamp()}.m4a")
-        val mediaRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) MediaRecorder(this) else {
-            @Suppress("DEPRECATION")
-            MediaRecorder()
+        val mediaRecorderResult = runCatching { createRecorder(file) }
+        val mediaRecorder = mediaRecorderResult.getOrElse {
+            appendEvent("Запись звонка недоступна: ${it.localizedMessage ?: "система заблокировала аудиоканал"}")
+            stopSelf()
+            return
         }
-
-        runCatching {
-            // MIC is the most compatible source while the phone is in a live call.
-            mediaRecorder.setAudioSource(MediaRecorder.AudioSource.MIC)
-            mediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            mediaRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-            mediaRecorder.setAudioEncodingBitRate(128_000)
-            mediaRecorder.setAudioSamplingRate(44_100)
-            mediaRecorder.setOutputFile(file.absolutePath)
-            mediaRecorder.prepare()
-            mediaRecorder.start()
-        }.onSuccess {
+        runCatching { mediaRecorder.start() }.onSuccess {
             recorder = mediaRecorder
             outputFile = file
             updateNotification("Идет запись звонка")
@@ -62,6 +53,42 @@ class CallRecordingService : Service() {
             appendEvent("Запись звонка не началась: ${it.localizedMessage ?: "доступ к микрофону закрыт"}")
             stopSelf()
         }
+    }
+
+    private fun createRecorder(file: File): MediaRecorder {
+        val sources = listOf(
+            MediaRecorder.AudioSource.VOICE_CALL,
+            MediaRecorder.AudioSource.VOICE_UPLINK,
+            MediaRecorder.AudioSource.VOICE_DOWNLINK,
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+            MediaRecorder.AudioSource.MIC
+        )
+        var lastError: Throwable? = null
+        for (source in sources) {
+            val candidate = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) MediaRecorder(this) else {
+                @Suppress("DEPRECATION")
+                MediaRecorder()
+            }
+            val prepared = runCatching {
+                candidate.setAudioSource(source)
+                candidate.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                candidate.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                candidate.setAudioEncodingBitRate(128_000)
+                candidate.setAudioSamplingRate(44_100)
+                candidate.setOutputFile(file.absolutePath)
+                candidate.prepare()
+                candidate
+            }.getOrElse {
+                lastError = it
+                candidate.release()
+                null
+            }
+            if (prepared != null) {
+                appendEvent("Выбран источник звонка: $source")
+                return prepared
+            }
+        }
+        throw IllegalStateException(lastError?.localizedMessage ?: "ни один источник аудио не доступен")
     }
 
     private fun stopRecording() {
