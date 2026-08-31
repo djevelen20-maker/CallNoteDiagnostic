@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.MediaPlayer
 import android.media.MediaRecorder
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
@@ -87,6 +88,10 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private object ActiveCallController {
+    var call: Call? = null
+}
+
 class CallStateReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != TelephonyManager.ACTION_PHONE_STATE_CHANGED) return
@@ -110,6 +115,7 @@ class CallNoteInCallService : InCallService() {
 
     override fun onCallAdded(call: Call) {
         super.onCallAdded(call)
+        ActiveCallController.call = call
         runCatching {
             callEventsFile(this).appendText("${timestampForNote()} - Звонок открыт в CallNote AI\n")
         }
@@ -125,6 +131,7 @@ class CallNoteInCallService : InCallService() {
     }
 
     override fun onCallRemoved(call: Call) {
+        if (ActiveCallController.call == call) ActiveCallController.call = null
         callbacks.remove(call)?.let { call.unregisterCallback(it) }
         stopCallRecording()
         runCatching {
@@ -155,6 +162,7 @@ private fun CallNoteApp() {
     val context = LocalContext.current
     var hasAudioPermission by remember { mutableStateOf(hasPermission(context, Manifest.permission.RECORD_AUDIO)) }
     var hasPhonePermission by remember { mutableStateOf(hasPermission(context, Manifest.permission.READ_PHONE_STATE)) }
+    var hasCallPermission by remember { mutableStateOf(hasPermission(context, Manifest.permission.CALL_PHONE)) }
     var hasNotificationPermission by remember {
         mutableStateOf(
             Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
@@ -167,6 +175,7 @@ private fun CallNoteApp() {
     ) {
         hasAudioPermission = hasPermission(context, Manifest.permission.RECORD_AUDIO)
         hasPhonePermission = hasPermission(context, Manifest.permission.READ_PHONE_STATE)
+        hasCallPermission = hasPermission(context, Manifest.permission.CALL_PHONE)
         hasNotificationPermission = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
             hasPermission(context, Manifest.permission.POST_NOTIFICATIONS)
     }
@@ -176,7 +185,7 @@ private fun CallNoteApp() {
     }
 
     LaunchedEffect(Unit) {
-        if (!hasAudioPermission || !hasPhonePermission || !hasNotificationPermission) {
+        if (!hasAudioPermission || !hasPhonePermission || !hasCallPermission || !hasNotificationPermission) {
             requestPermissions()
         }
     }
@@ -187,6 +196,7 @@ private fun CallNoteApp() {
                 context = context,
                 hasAudioPermission = hasAudioPermission,
                 hasPhonePermission = hasPhonePermission,
+                hasCallPermission = hasCallPermission,
                 hasNotificationPermission = hasNotificationPermission,
                 requestPermissions = ::requestPermissions
             )
@@ -199,6 +209,7 @@ private fun CallNoteHome(
     context: Context,
     hasAudioPermission: Boolean,
     hasPhonePermission: Boolean,
+    hasCallPermission: Boolean,
     hasNotificationPermission: Boolean,
     requestPermissions: () -> Unit
 ) {
@@ -213,7 +224,9 @@ private fun CallNoteHome(
     var status by remember { mutableStateOf("Готов к записи, заметкам и проверке звонка") }
     var noteText by remember { mutableStateOf("") }
     var selectedSource by remember { mutableStateOf(recordingSourceOptions().first()) }
-    var selectedTab by remember { mutableStateOf(AppTab.Recorder) }
+    var selectedTab by remember { mutableStateOf(AppTab.Phone) }
+    var dialNumber by remember { mutableStateOf((context as? Activity)?.intent?.data?.schemeSpecificPart.orEmpty()) }
+    var callState by remember { mutableIntStateOf(Call.STATE_DISCONNECTED) }
     var aiDraft by remember { mutableStateOf("") }
     var speechText by remember { mutableStateOf("") }
     var transcriptionFile by remember { mutableStateOf<String?>(null) }
@@ -319,6 +332,27 @@ private fun CallNoteHome(
         refreshNotes()
         refreshCalls()
         aiDraft = aiDraftsFile(context).takeIf { it.exists() }?.readText().orEmpty()
+    }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            callState = ActiveCallController.call?.state ?: Call.STATE_DISCONNECTED
+            delay(500)
+        }
+    }
+
+    fun placeCall() {
+        val number = dialNumber.filter { it.isDigit() || it == '+' || it == '*' || it == '#' }
+        if (number.isBlank()) return
+        if (!hasCallPermission) {
+            requestPermissions()
+            return
+        }
+        runCatching {
+            context.getSystemService(TelecomManager::class.java)
+                ?.placeCall(Uri.parse("tel:${Uri.encode(number)}"), Bundle())
+            callState = Call.STATE_DIALING
+        }.onFailure { status = "Не удалось начать звонок: ${it.localizedMessage ?: "проверьте телефонные разрешения"}" }
     }
 
     LaunchedEffect(isRecording) {
@@ -583,6 +617,14 @@ private fun CallNoteHome(
             )
 
             when (selectedTab) {
+                AppTab.Phone -> PhoneTab(
+                    number = dialNumber,
+                    callState = callState,
+                    onNumberChanged = { dialNumber = it },
+                    onCall = ::placeCall,
+                    onAnswer = { ActiveCallController.call?.answer(android.telecom.VideoProfile.STATE_AUDIO_ONLY) },
+                    onHangUp = { ActiveCallController.call?.disconnect() }
+                )
                 AppTab.Recorder -> RecorderTab(
                     recordings = recordings,
                     isRecording = isRecording,
@@ -783,6 +825,50 @@ private fun RecorderTab(
                 onDelete = { onDelete(file) }
             )
         }
+    }
+}
+
+@Composable
+private fun PhoneTab(
+    number: String,
+    callState: Int,
+    onNumberChanged: (String) -> Unit,
+    onCall: () -> Unit,
+    onAnswer: () -> Unit,
+    onHangUp: () -> Unit
+) {
+    SectionTitle("Телефон")
+    OutlinedTextField(
+        value = number,
+        onValueChange = { onNumberChanged(it.filter { ch -> ch.isDigit() || ch in "+*#" }) },
+        modifier = Modifier.fillMaxWidth(),
+        label = { Text("Номер телефона") },
+        singleLine = true
+    )
+    val keys = listOf("1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "0", "#")
+    keys.chunked(3).forEach { row ->
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            row.forEach { key ->
+                OutlinedButton(
+                    onClick = { onNumberChanged(number + key) },
+                    modifier = Modifier.weight(1f).height(56.dp)
+                ) { Text(key, fontSize = 21.sp) }
+            }
+        }
+    }
+    val active = callState == Call.STATE_ACTIVE || callState == Call.STATE_DIALING || callState == Call.STATE_CONNECTING
+    val ringing = callState == Call.STATE_RINGING
+    if (ringing) {
+        FeaturePanel(title = "Входящий звонок", body = "Ответьте, чтобы начать разговор")
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Button(onClick = onAnswer, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = Steel)) { Text("Ответить") }
+            OutlinedButton(onClick = onHangUp, modifier = Modifier.weight(1f)) { Text("Отклонить") }
+        }
+    } else if (active) {
+        FeaturePanel(title = "Разговор идет", body = "CallNote AI подключен к звонку")
+        Button(onClick = onHangUp, modifier = Modifier.fillMaxWidth().height(54.dp), colors = ButtonDefaults.buttonColors(containerColor = Wine)) { Text("Завершить звонок") }
+    } else {
+        Button(onClick = onCall, modifier = Modifier.fillMaxWidth().height(56.dp), colors = ButtonDefaults.buttonColors(containerColor = Gold)) { Text("Позвонить", color = Ink, fontWeight = FontWeight.Bold) }
     }
 }
 
@@ -1085,6 +1171,7 @@ private fun requiredPermissions(): Array<String> {
         Manifest.permission.RECORD_AUDIO,
         Manifest.permission.READ_PHONE_STATE,
         Manifest.permission.ANSWER_PHONE_CALLS
+        ,Manifest.permission.CALL_PHONE
     )
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         permissions += Manifest.permission.POST_NOTIFICATIONS
@@ -1144,6 +1231,7 @@ private fun formatFileSize(bytes: Long): String {
 }
 
 private enum class AppTab(val title: String) {
+    Phone("Телефон"),
     Recorder("Диктофон"),
     Calls("Звонки"),
     Notes("Заметки"),
