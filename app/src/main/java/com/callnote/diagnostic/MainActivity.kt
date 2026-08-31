@@ -2,6 +2,7 @@ package com.callnote.diagnostic
 
 import android.Manifest
 import android.app.Activity
+import android.app.role.RoleManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -11,8 +12,12 @@ import android.media.MediaRecorder
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.ParcelFileDescriptor
 import android.speech.RecognizerIntent
 import android.telephony.TelephonyManager
+import android.telecom.Call
+import android.telecom.InCallService
+import android.telecom.TelecomManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -97,6 +102,51 @@ class CallStateReceiver : BroadcastReceiver() {
     }
 }
 
+class CallNoteInCallService : InCallService() {
+    private val callbacks = mutableMapOf<Call, Call.Callback>()
+
+    override fun onCallAdded(call: Call) {
+        super.onCallAdded(call)
+        runCatching {
+            callEventsFile(this).appendText("${timestampForNote()} - Звонок открыт в CallNote AI\n")
+        }
+        val callback = object : Call.Callback() {
+            override fun onStateChanged(call: Call, state: Int) {
+                if (state == Call.STATE_ACTIVE) startCallRecording()
+                if (state == Call.STATE_DISCONNECTED) stopCallRecording()
+            }
+        }
+        callbacks[call] = callback
+        call.registerCallback(callback)
+        if (call.state == Call.STATE_ACTIVE) startCallRecording()
+    }
+
+    override fun onCallRemoved(call: Call) {
+        callbacks.remove(call)?.let { call.unregisterCallback(it) }
+        stopCallRecording()
+        runCatching {
+            callEventsFile(this).appendText("${timestampForNote()} - Звонок закрыт в CallNote AI\n")
+        }
+        super.onCallRemoved(call)
+    }
+
+    private fun startCallRecording() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            callEventsFile(this).appendText("${timestampForNote()} - Нет разрешения на микрофон для записи звонка\n")
+            return
+        }
+        val intent = Intent(this, CallRecordingService::class.java).setAction(CallRecordingService.ACTION_START)
+        runCatching { ContextCompat.startForegroundService(this, intent) }
+            .onFailure { callEventsFile(this).appendText("${timestampForNote()} - Сервис записи не запущен: ${it.localizedMessage}\n") }
+    }
+
+    private fun stopCallRecording() {
+        runCatching {
+            startService(Intent(this, CallRecordingService::class.java).setAction(CallRecordingService.ACTION_STOP))
+        }
+    }
+}
+
 @Composable
 private fun CallNoteApp() {
     val context = LocalContext.current
@@ -161,6 +211,8 @@ private fun CallNoteHome(
     var selectedTab by remember { mutableStateOf(AppTab.Recorder) }
     var aiDraft by remember { mutableStateOf("") }
     var speechText by remember { mutableStateOf("") }
+    var transcriptionFile by remember { mutableStateOf<String?>(null) }
+    var audioSourceDescriptor: ParcelFileDescriptor? = null
     val recordings = remember { mutableStateListOf<File>() }
     val notes = remember { mutableStateListOf<String>() }
     val callEvents = remember { mutableStateListOf<String>() }
@@ -168,14 +220,28 @@ private fun CallNoteHome(
     val speechLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
+        audioSourceDescriptor?.close()
+        audioSourceDescriptor = null
         if (result.resultCode == Activity.RESULT_OK) {
             val matches = result.data
                 ?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
                 .orEmpty()
             speechText = matches.firstOrNull().orEmpty()
-            status = if (speechText.isBlank()) "Речь не распознана" else "Речь распознана"
+            status = if (speechText.isBlank()) "Речь не распознана" else {
+                if (transcriptionFile == null) "Речь распознана" else "Аудио расшифровано"
+            }
         } else {
             status = "Распознавание отменено"
+        }
+    }
+
+    val dialerRoleLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        status = if (result.resultCode == Activity.RESULT_OK) {
+            "CallNote AI выбран как приложение телефона"
+        } else {
+            "Роль приложения телефона не выдана"
         }
     }
 
@@ -359,9 +425,43 @@ private fun CallNoteHome(
         }
 
         runCatching {
+            transcriptionFile = null
             speechLauncher.launch(intent)
         }.onFailure {
             status = "На телефоне нет доступного сервиса распознавания речи"
+        }
+    }
+
+    fun transcribeRecording(file: File) {
+        if (!hasAudioPermission) {
+            requestPermissions()
+            status = "Разрешите доступ к микрофону для расшифровки"
+            return
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            status = "Расшифровка файла доступна на Android 12 и новее"
+            return
+        }
+        runCatching {
+            audioSourceDescriptor?.close()
+            audioSourceDescriptor = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+            transcriptionFile = file.name
+            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
+                putExtra(RecognizerIntent.EXTRA_PROMPT, "Расшифровка записи CallNote AI")
+                putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, audioSourceDescriptor)
+                putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
+                putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, 44_100)
+                putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, 2)
+            }
+            speechLauncher.launch(intent)
+            status = "Расшифровка аудио началась"
+        }.onFailure {
+            audioSourceDescriptor?.close()
+            audioSourceDescriptor = null
+            transcriptionFile = null
+            status = "Не удалось открыть аудиофайл для расшифровки"
         }
     }
 
@@ -374,6 +474,23 @@ private fun CallNoteHome(
         notesFile(context).appendText("${timestampForNote()} - $text\n")
         status = "Распознанный текст сохранен"
         refreshNotes()
+    }
+
+    fun requestDialerIntegration() {
+        val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val roleManager = context.getSystemService(RoleManager::class.java)
+            roleManager.createRequestRoleIntent(RoleManager.ROLE_DIALER)
+        } else {
+            Intent(TelecomManager.ACTION_CHANGE_DEFAULT_DIALER).apply {
+                putExtra(TelecomManager.EXTRA_CHANGE_DEFAULT_DIALER_PACKAGE_NAME, context.packageName)
+            }
+        }
+
+        runCatching {
+            dialerRoleLauncher.launch(intent)
+        }.onFailure {
+            status = "Телефон не разрешил запрос роли звонилки"
+        }
     }
 
     Box(
@@ -446,6 +563,7 @@ private fun CallNoteHome(
                     aiDraft = aiDraft,
                     speechText = speechText,
                     onStartSpeech = ::startSpeechRecognition,
+                    onTranscribeRecording = ::transcribeRecording,
                     onSaveSpeech = ::saveSpeechAsNote,
                     onBuildDraft = ::buildAiDraft
                 )
@@ -455,7 +573,9 @@ private fun CallNoteHome(
                     hasAudioPermission = hasAudioPermission,
                     hasPhonePermission = hasPhonePermission,
                     hasNotificationPermission = hasNotificationPermission,
-                    onRequestPermissions = requestPermissions
+                    isDefaultDialer = isDefaultDialer(context),
+                    onRequestPermissions = requestPermissions,
+                    onRequestDialerIntegration = ::requestDialerIntegration
                 )
             }
 
@@ -697,6 +817,7 @@ private fun AiTab(
     aiDraft: String,
     speechText: String,
     onStartSpeech: () -> Unit,
+    onTranscribeRecording: (File) -> Unit,
     onSaveSpeech: () -> Unit,
     onBuildDraft: () -> Unit
 ) {
@@ -722,6 +843,14 @@ private fun AiTab(
         }
     }
     InfoLine("Последняя запись", recordings.firstOrNull()?.name ?: "нет записей")
+    recordings.firstOrNull()?.let { file ->
+        OutlinedButton(
+            onClick = { onTranscribeRecording(file) },
+            modifier = Modifier.fillMaxWidth().height(50.dp)
+        ) {
+            Text("Расшифровать последнюю запись")
+        }
+    }
     InfoLine("Последняя заметка", notes.firstOrNull() ?: "нет заметок")
     Button(
         onClick = onBuildDraft,
@@ -741,12 +870,15 @@ private fun SettingsTab(
     hasAudioPermission: Boolean,
     hasPhonePermission: Boolean,
     hasNotificationPermission: Boolean,
-    onRequestPermissions: () -> Unit
+    isDefaultDialer: Boolean,
+    onRequestPermissions: () -> Unit,
+    onRequestDialerIntegration: () -> Unit
 ) {
     SectionTitle("Настройки")
     InfoLine("Микрофон", if (hasAudioPermission) "разрешен" else "нужно разрешить")
     InfoLine("Состояние телефона", if (hasPhonePermission) "разрешено" else "нужно разрешить")
     InfoLine("Уведомления", if (hasNotificationPermission) "разрешены" else "нужно разрешить")
+    InfoLine("Интеграция со звонилкой", if (isDefaultDialer) "CallNote AI выбран как приложение телефона" else "нужно выдать роль приложения телефона")
     InfoLine("Папка записей", recordingsDir(context).absolutePath)
 
     Button(
@@ -757,9 +889,17 @@ private fun SettingsTab(
         Text("Проверить разрешения", color = Color.White, fontWeight = FontWeight.Bold)
     }
 
+    Button(
+        onClick = onRequestDialerIntegration,
+        modifier = Modifier.fillMaxWidth().height(52.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = Gold)
+    ) {
+        Text("Встроить в звонилку", color = Ink, fontWeight = FontWeight.Bold)
+    }
+
     FeaturePanel(
         title = "Ограничение Android",
-        body = "Обычное приложение может записывать микрофон, но не имеет системного доступа к внутреннему аудио звонка. Поэтому на Android 10+ и особенно Android 14 голос собеседника часто доступен только через громкую связь или штатную запись производителя."
+        body = "CallNote AI может запросить роль приложения телефона и получать события звонка через Telecom. Но внутренний звук разговора закрыт системным разрешением, которое обычному APK не выдается. Поэтому роль звонилки помогает встроиться в звонок, но не гарантирует запись собеседника."
     )
 }
 
@@ -885,12 +1025,18 @@ private fun hasPermission(context: Context, permission: String): Boolean {
 private fun requiredPermissions(): Array<String> {
     val permissions = mutableListOf(
         Manifest.permission.RECORD_AUDIO,
-        Manifest.permission.READ_PHONE_STATE
+        Manifest.permission.READ_PHONE_STATE,
+        Manifest.permission.ANSWER_PHONE_CALLS
     )
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         permissions += Manifest.permission.POST_NOTIFICATIONS
     }
     return permissions.toTypedArray()
+}
+
+private fun isDefaultDialer(context: Context): Boolean {
+    val telecomManager = context.getSystemService(TelecomManager::class.java)
+    return telecomManager?.defaultDialerPackage == context.packageName
 }
 
 private fun recordingsDir(context: Context): File {
@@ -997,3 +1143,4 @@ private val Steel = Color(0xFF2D6F88)
 private val Wine = Color(0xFFC85C5C)
 private val SoftText = Color(0xFFC9D1CE)
 private val Line = Color(0xFF34413F)
+
