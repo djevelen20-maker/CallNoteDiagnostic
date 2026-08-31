@@ -14,6 +14,8 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.ParcelFileDescriptor
 import android.speech.RecognizerIntent
+import android.speech.RecognitionListener
+import android.speech.SpeechRecognizer
 import android.telephony.TelephonyManager
 import android.telecom.Call
 import android.telecom.InCallService
@@ -213,6 +215,13 @@ private fun CallNoteHome(
     var speechText by remember { mutableStateOf("") }
     var transcriptionFile by remember { mutableStateOf<String?>(null) }
     var audioSourceDescriptor: ParcelFileDescriptor? = null
+    val speechRecognizer = remember(context) {
+        if (SpeechRecognizer.isRecognitionAvailable(context)) {
+            SpeechRecognizer.createSpeechRecognizer(context)
+        } else {
+            null
+        }
+    }
     val recordings = remember { mutableStateListOf<File>() }
     val notes = remember { mutableStateListOf<String>() }
     val callEvents = remember { mutableStateListOf<String>() }
@@ -233,6 +242,39 @@ private fun CallNoteHome(
         } else {
             status = "Распознавание отменено"
         }
+    }
+
+    DisposableEffect(speechRecognizer) {
+        speechRecognizer?.setRecognitionListener(object : RecognitionListener {
+            override fun onReadyForSpeech(params: Bundle?) { status = "Говорите, идет распознавание" }
+            override fun onBeginningOfSpeech() { status = "Слушаю речь" }
+            override fun onRmsChanged(rmsdB: Float) { lastAmplitude = (rmsdB * 100).toInt().coerceAtLeast(0) }
+            override fun onBufferReceived(buffer: ByteArray?) {}
+            override fun onEndOfSpeech() { status = "Обрабатываю речь" }
+            override fun onError(error: Int) {
+                status = when (error) {
+                    SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Нет соединения с сервисом распознавания"
+                    SpeechRecognizer.ERROR_AUDIO -> "Сервис не получил звук с микрофона"
+                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Разрешите микрофон для распознавания"
+                    SpeechRecognizer.ERROR_NO_MATCH -> "Слова не разобраны: говорите громче и ближе к телефону"
+                    SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Распознавание уже занято другим приложением"
+                    else -> "Ошибка распознавания речи: $error"
+                }
+            }
+            override fun onResults(results: Bundle?) {
+                speechText = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    ?.firstOrNull().orEmpty()
+                transcriptionFile = null
+                status = if (speechText.isBlank()) "Речь не распознана" else "Текст получен"
+            }
+            override fun onPartialResults(partialResults: Bundle?) {
+                val partial = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    ?.firstOrNull().orEmpty()
+                if (partial.isNotBlank()) speechText = partial
+            }
+            override fun onEvent(eventType: Int, params: Bundle?) {}
+        })
+        onDispose { speechRecognizer?.destroy() }
     }
 
     val dialerRoleLauncher = rememberLauncherForActivityResult(
@@ -417,18 +459,28 @@ private fun CallNoteHome(
             return
         }
 
+        if (isRecording) {
+            stopRecording()
+            status = "Запись сохранена. Теперь говорите для расшифровки"
+        }
+        speechText = ""
+        transcriptionFile = null
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
             putExtra(RecognizerIntent.EXTRA_PROMPT, "Говорите, CallNote AI слушает")
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
         }
 
         runCatching {
-            transcriptionFile = null
-            speechLauncher.launch(intent)
+            if (speechRecognizer == null) {
+                status = "На телефоне нет голосового сервиса. Установите или включите Google Voice Input"
+            } else {
+                speechRecognizer.startListening(intent)
+            }
         }.onFailure {
-            status = "На телефоне нет доступного сервиса распознавания речи"
+            status = "Не удалось запустить распознавание: ${it.localizedMessage ?: "проверьте микрофон"}"
         }
     }
 
