@@ -1,19 +1,25 @@
 package com.callnote.diagnostic
 
 import android.Manifest
+import android.app.Activity
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.speech.RecognizerIntent
+import android.telephony.TelephonyManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -26,20 +32,20 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.Divider
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -49,7 +55,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
@@ -74,26 +79,52 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+class CallStateReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action != TelephonyManager.ACTION_PHONE_STATE_CHANGED) return
+
+        val rawState = intent.getStringExtra(TelephonyManager.EXTRA_STATE).orEmpty()
+        val state = when (rawState) {
+            TelephonyManager.EXTRA_STATE_RINGING -> "Входящий звонок"
+            TelephonyManager.EXTRA_STATE_OFFHOOK -> "Разговор начался"
+            TelephonyManager.EXTRA_STATE_IDLE -> "Звонок завершен"
+            else -> "Состояние звонка изменилось"
+        }
+
+        runCatching {
+            callEventsFile(context).appendText("${timestampForNote()} - $state\n")
+        }
+    }
+}
+
 @Composable
 private fun CallNoteApp() {
     val context = LocalContext.current
-    var hasAudioPermission by remember {
+    var hasAudioPermission by remember { mutableStateOf(hasPermission(context, Manifest.permission.RECORD_AUDIO)) }
+    var hasPhonePermission by remember { mutableStateOf(hasPermission(context, Manifest.permission.READ_PHONE_STATE)) }
+    var hasNotificationPermission by remember {
         mutableStateOf(
-            ContextCompat.checkSelfPermission(
-                context,
-                Manifest.permission.RECORD_AUDIO
-            ) == PackageManager.PERMISSION_GRANTED
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                hasPermission(context, Manifest.permission.POST_NOTIFICATIONS)
         )
     }
-    val permissionLauncher = rememberLauncherForActivityResult(
+
+    val permissionsLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { result ->
-        hasAudioPermission = result[Manifest.permission.RECORD_AUDIO] == true
+    ) {
+        hasAudioPermission = hasPermission(context, Manifest.permission.RECORD_AUDIO)
+        hasPhonePermission = hasPermission(context, Manifest.permission.READ_PHONE_STATE)
+        hasNotificationPermission = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            hasPermission(context, Manifest.permission.POST_NOTIFICATIONS)
+    }
+
+    fun requestPermissions() {
+        permissionsLauncher.launch(requiredPermissions())
     }
 
     LaunchedEffect(Unit) {
-        if (!hasAudioPermission) {
-            permissionLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
+        if (!hasAudioPermission || !hasPhonePermission || !hasNotificationPermission) {
+            requestPermissions()
         }
     }
 
@@ -102,9 +133,9 @@ private fun CallNoteApp() {
             CallNoteHome(
                 context = context,
                 hasAudioPermission = hasAudioPermission,
-                requestPermission = {
-                    permissionLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
-                }
+                hasPhonePermission = hasPhonePermission,
+                hasNotificationPermission = hasNotificationPermission,
+                requestPermissions = ::requestPermissions
             )
         }
     }
@@ -114,17 +145,39 @@ private fun CallNoteApp() {
 private fun CallNoteHome(
     context: Context,
     hasAudioPermission: Boolean,
-    requestPermission: () -> Unit
+    hasPhonePermission: Boolean,
+    hasNotificationPermission: Boolean,
+    requestPermissions: () -> Unit
 ) {
     var recorder by remember { mutableStateOf<MediaRecorder?>(null) }
     var player by remember { mutableStateOf<MediaPlayer?>(null) }
     var isRecording by remember { mutableStateOf(false) }
     var elapsedSeconds by remember { mutableIntStateOf(0) }
+    var lastAmplitude by remember { mutableIntStateOf(0) }
     var nowPlaying by remember { mutableStateOf<String?>(null) }
-    var status by remember { mutableStateOf("Готов к записи и заметкам") }
+    var status by remember { mutableStateOf("Готов к записи, заметкам и проверке звонка") }
     var noteText by remember { mutableStateOf("") }
+    var selectedSource by remember { mutableStateOf(recordingSourceOptions().first()) }
+    var selectedTab by remember { mutableStateOf(AppTab.Recorder) }
+    var aiDraft by remember { mutableStateOf("") }
+    var speechText by remember { mutableStateOf("") }
     val recordings = remember { mutableStateListOf<File>() }
     val notes = remember { mutableStateListOf<String>() }
+    val callEvents = remember { mutableStateListOf<String>() }
+
+    val speechLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val matches = result.data
+                ?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+                .orEmpty()
+            speechText = matches.firstOrNull().orEmpty()
+            status = if (speechText.isBlank()) "Речь не распознана" else "Речь распознана"
+        } else {
+            status = "Распознавание отменено"
+        }
+    }
 
     fun refreshRecordings() {
         recordings.clear()
@@ -142,9 +195,19 @@ private fun CallNoteHome(
         }
     }
 
+    fun refreshCalls() {
+        callEvents.clear()
+        val file = callEventsFile(context)
+        if (file.exists()) {
+            callEvents.addAll(file.readLines().filter { it.isNotBlank() }.asReversed())
+        }
+    }
+
     LaunchedEffect(Unit) {
         refreshRecordings()
         refreshNotes()
+        refreshCalls()
+        aiDraft = aiDraftsFile(context).takeIf { it.exists() }?.readText().orEmpty()
     }
 
     LaunchedEffect(isRecording) {
@@ -152,8 +215,17 @@ private fun CallNoteHome(
             elapsedSeconds = 0
             while (isRecording) {
                 delay(1000)
+                lastAmplitude = runCatching { recorder?.maxAmplitude ?: 0 }.getOrDefault(0)
                 elapsedSeconds += 1
             }
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            runCatching { recorder?.stop() }
+            recorder?.release()
+            player?.release()
         }
     }
 
@@ -170,19 +242,21 @@ private fun CallNoteHome(
         recorder?.release()
         recorder = null
         isRecording = false
+        lastAmplitude = 0
         status = "Запись сохранена: ${formatTimer(elapsedSeconds)}"
         refreshRecordings()
     }
 
-    fun startRecording() {
+    fun startRecording(callMode: Boolean = false) {
         if (!hasAudioPermission) {
-            requestPermission()
+            requestPermissions()
             status = "Разрешите доступ к микрофону"
             return
         }
 
         stopPlayer()
-        val target = File(recordingsDir(context), "callnote_${timestampForFile()}.m4a")
+        val prefix = if (callMode) "calltest" else selectedSource.filePrefix
+        val target = File(recordingsDir(context), "callnote_${prefix}_${timestampForFile()}.m4a")
         val mediaRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             MediaRecorder(context)
         } else {
@@ -191,7 +265,7 @@ private fun CallNoteHome(
         }
 
         runCatching {
-            mediaRecorder.setAudioSource(MediaRecorder.AudioSource.MIC)
+            mediaRecorder.setAudioSource(selectedSource.audioSource)
             mediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             mediaRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
             mediaRecorder.setAudioEncodingBitRate(128_000)
@@ -202,7 +276,11 @@ private fun CallNoteHome(
         }.onSuccess {
             recorder = mediaRecorder
             isRecording = true
-            status = "Идет запись"
+            status = if (callMode) {
+                "Проверка звонка: ${selectedSource.title}"
+            } else {
+                "Идет запись: ${selectedSource.title}"
+            }
         }.onFailure {
             mediaRecorder.release()
             status = "Не удалось начать запись: ${it.localizedMessage ?: "ошибка микрофона"}"
@@ -245,6 +323,59 @@ private fun CallNoteHome(
         refreshNotes()
     }
 
+    fun buildAiDraft() {
+        val latestRecording = recordings.firstOrNull()?.name ?: "запись пока не выбрана"
+        val latestNote = speechText.ifBlank { notes.firstOrNull() ?: "заметок пока нет" }
+        aiDraft = """
+            AI-черновик CallNote AI
+            Создано: ${timestampForNote()}
+            Аудио: $latestRecording
+            Текст: $latestNote
+
+            Резюме:
+            Подготовлен локальный черновик анализа по распознанной речи и заметкам. Для автоматической расшифровки сохраненных аудиофайлов нужен серверный модуль или AI API.
+
+            Действия:
+            1. Проверить качество аудио.
+            2. Добавить важные пункты в заметку.
+            3. Отправить запись в AI-модуль после подключения backend.
+        """.trimIndent()
+        aiDraftsFile(context).writeText(aiDraft)
+        status = "AI-черновик подготовлен"
+    }
+
+    fun startSpeechRecognition() {
+        if (!hasAudioPermission) {
+            requestPermissions()
+            status = "Разрешите микрофон для распознавания речи"
+            return
+        }
+
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
+            putExtra(RecognizerIntent.EXTRA_PROMPT, "Говорите, CallNote AI слушает")
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+        }
+
+        runCatching {
+            speechLauncher.launch(intent)
+        }.onFailure {
+            status = "На телефоне нет доступного сервиса распознавания речи"
+        }
+    }
+
+    fun saveSpeechAsNote() {
+        val text = speechText.trim()
+        if (text.isBlank()) {
+            status = "Сначала распознайте речь"
+            return
+        }
+        notesFile(context).appendText("${timestampForNote()} - $text\n")
+        status = "Распознанный текст сохранен"
+        refreshNotes()
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -258,82 +389,75 @@ private fun CallNoteHome(
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             Header()
-
+            TabBar(selectedTab = selectedTab, onSelect = { selectedTab = it })
             StatusCard(
                 isRecording = isRecording,
                 elapsedSeconds = elapsedSeconds,
+                lastAmplitude = lastAmplitude,
                 status = status
             )
 
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Button(
-                    onClick = { if (isRecording) stopRecording() else startRecording() },
-                    modifier = Modifier.weight(1f).height(54.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = if (isRecording) Wine else Gold)
-                ) {
-                    Text(if (isRecording) "Остановить" else "Записать", color = Ink, fontWeight = FontWeight.Bold)
-                }
+            when (selectedTab) {
+                AppTab.Recorder -> RecorderTab(
+                    recordings = recordings,
+                    selectedSource = selectedSource,
+                    isRecording = isRecording,
+                    nowPlaying = nowPlaying,
+                    onSourceSelected = { selectedSource = it },
+                    onRecord = { if (isRecording) stopRecording() else startRecording() },
+                    onStopPlayer = {
+                        stopPlayer()
+                        status = "Воспроизведение остановлено"
+                    },
+                    onPlay = ::playRecording,
+                    onDelete = {
+                        if (nowPlaying == it.name) stopPlayer()
+                        it.delete()
+                        status = "Запись удалена"
+                        refreshRecordings()
+                    }
+                )
 
-                OutlinedButton(
-                    onClick = { stopPlayer(); status = "Воспроизведение остановлено" },
-                    modifier = Modifier.weight(1f).height(54.dp),
-                    enabled = nowPlaying != null
-                ) {
-                    Text("Стоп")
-                }
+                AppTab.Calls -> CallsTab(
+                    selectedSource = selectedSource,
+                    isRecording = isRecording,
+                    lastAmplitude = lastAmplitude,
+                    callEvents = callEvents,
+                    hasPhonePermission = hasPhonePermission,
+                    onSourceSelected = { selectedSource = it },
+                    onCallTest = { if (isRecording) stopRecording() else startRecording(callMode = true) },
+                    onRefreshCalls = {
+                        refreshCalls()
+                        status = "Журнал звонков обновлен"
+                    },
+                    onRequestPermissions = requestPermissions
+                )
+
+                AppTab.Notes -> NotesTab(
+                    noteText = noteText,
+                    notes = notes,
+                    onNoteChanged = { noteText = it },
+                    onSaveNote = ::saveNote
+                )
+
+                AppTab.Ai -> AiTab(
+                    recordings = recordings,
+                    notes = notes,
+                    aiDraft = aiDraft,
+                    speechText = speechText,
+                    onStartSpeech = ::startSpeechRecognition,
+                    onSaveSpeech = ::saveSpeechAsNote,
+                    onBuildDraft = ::buildAiDraft
+                )
+
+                AppTab.Settings -> SettingsTab(
+                    context = context,
+                    hasAudioPermission = hasAudioPermission,
+                    hasPhonePermission = hasPhonePermission,
+                    hasNotificationPermission = hasNotificationPermission,
+                    onRequestPermissions = requestPermissions
+                )
             }
-
-            SectionTitle("Мои записи")
-            if (recordings.isEmpty()) {
-                EmptyPanel("Записей пока нет. Нажмите «Записать», чтобы создать первую аудиозаметку.")
-            } else {
-                recordings.forEach { file ->
-                    RecordingRow(
-                        file = file,
-                        isPlaying = nowPlaying == file.name,
-                        onPlay = { playRecording(file) },
-                        onDelete = {
-                            if (nowPlaying == file.name) stopPlayer()
-                            file.delete()
-                            status = "Запись удалена"
-                            refreshRecordings()
-                        }
-                    )
-                }
-            }
-
-            SectionTitle("Заметки")
-            OutlinedTextField(
-                value = noteText,
-                onValueChange = { noteText = it },
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text("Заметка к разговору") },
-                minLines = 3
-            )
-            Button(
-                onClick = { saveNote() },
-                modifier = Modifier.fillMaxWidth().height(50.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Steel)
-            ) {
-                Text("Сохранить заметку", color = Color.White, fontWeight = FontWeight.Bold)
-            }
-
-            notes.take(4).forEach {
-                Text(it, color = SoftText, fontSize = 14.sp, lineHeight = 19.sp)
-                Divider(color = Line)
-            }
-
-            SectionTitle("AI")
-            FeaturePanel(
-                title = "Расшифровка и краткое содержание",
-                body = "Каркас AI-модуля готов: записи сохраняются как .m4a, следующий шаг - подключить распознавание речи и резюме разговоров."
-            )
-
-            SectionTitle("Звонки")
-            FeaturePanel(
-                title = "Подготовка под Huawei Android 14",
-                body = "Добавлена база для ручных записей и заметок. Автоматическая запись звонков зависит от ограничений прошивки и системных разрешений."
-            )
 
             Spacer(Modifier.height(18.dp))
         }
@@ -346,14 +470,20 @@ private fun Header() {
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Image(
-            painter = painterResource(id = R.drawable.avamishin_logo),
-            contentDescription = "AVAMishin",
+        Box(
             modifier = Modifier
-                .size(76.dp)
-                .clip(CircleShape),
-            contentScale = ContentScale.Crop
-        )
+                .size(width = 94.dp, height = 74.dp)
+                .background(Color.White.copy(alpha = 0.08f), RoundedCornerShape(8.dp))
+                .padding(6.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Image(
+                painter = painterResource(id = R.drawable.avamishin_logo),
+                contentDescription = "AVAMishin",
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Fit
+            )
+        }
         Spacer(Modifier.width(14.dp))
         Column {
             Text("CallNote AI", color = Color.White, fontSize = 30.sp, fontWeight = FontWeight.Bold)
@@ -364,7 +494,32 @@ private fun Header() {
 }
 
 @Composable
-private fun StatusCard(isRecording: Boolean, elapsedSeconds: Int, status: String) {
+private fun TabBar(selectedTab: AppTab, onSelect: (AppTab) -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        AppTab.entries.forEach { tab ->
+            val selected = selectedTab == tab
+            OutlinedButton(
+                onClick = { onSelect(tab) },
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = if (selected) Gold.copy(alpha = 0.18f) else Color.Transparent,
+                    contentColor = if (selected) Gold else SoftText
+                )
+            ) {
+                Text(tab.title, fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatusCard(isRecording: Boolean, elapsedSeconds: Int, lastAmplitude: Int, status: String) {
+    val level = if (isRecording) (lastAmplitude / 32767f).coerceIn(0.02f, 1f) else 0f
+
     Card(
         colors = CardDefaults.cardColors(containerColor = Panel),
         shape = RoundedCornerShape(8.dp),
@@ -374,8 +529,266 @@ private fun StatusCard(isRecording: Boolean, elapsedSeconds: Int, status: String
             Text(if (isRecording) "Запись идет" else "Диктофон готов", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(8.dp))
             Text(formatTimer(elapsedSeconds), color = if (isRecording) Gold else SoftText, fontSize = 34.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(8.dp))
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(8.dp)
+                    .background(Line, RoundedCornerShape(8.dp))
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth(level)
+                        .height(8.dp)
+                        .background(if (lastAmplitude > 0) Gold else Wine, RoundedCornerShape(8.dp))
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            Text("Уровень звука: $lastAmplitude", color = SoftText, fontSize = 13.sp)
             Spacer(Modifier.height(6.dp))
             Text(status, color = SoftText, fontSize = 14.sp)
+        }
+    }
+}
+
+@Composable
+private fun RecorderTab(
+    recordings: List<File>,
+    selectedSource: RecordingSourceOption,
+    isRecording: Boolean,
+    nowPlaying: String?,
+    onSourceSelected: (RecordingSourceOption) -> Unit,
+    onRecord: () -> Unit,
+    onStopPlayer: () -> Unit,
+    onPlay: (File) -> Unit,
+    onDelete: (File) -> Unit
+) {
+    SectionTitle("Источник записи")
+    RecordingSourcePicker(
+        selectedSource = selectedSource,
+        enabled = !isRecording,
+        onSelect = onSourceSelected
+    )
+
+    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Button(
+            onClick = onRecord,
+            modifier = Modifier.weight(1f).height(54.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = if (isRecording) Wine else Gold)
+        ) {
+            Text(if (isRecording) "Остановить" else "Записать", color = Ink, fontWeight = FontWeight.Bold)
+        }
+
+        OutlinedButton(
+            onClick = onStopPlayer,
+            modifier = Modifier.weight(1f).height(54.dp),
+            enabled = nowPlaying != null
+        ) {
+            Text("Стоп")
+        }
+    }
+
+    SectionTitle("Мои записи")
+    if (recordings.isEmpty()) {
+        EmptyPanel("Записей пока нет. Нажмите «Записать», чтобы создать первую аудиозаметку.")
+    } else {
+        recordings.forEach { file ->
+            RecordingRow(
+                file = file,
+                isPlaying = nowPlaying == file.name,
+                onPlay = { onPlay(file) },
+                onDelete = { onDelete(file) }
+            )
+        }
+    }
+}
+
+@Composable
+private fun CallsTab(
+    selectedSource: RecordingSourceOption,
+    isRecording: Boolean,
+    lastAmplitude: Int,
+    callEvents: List<String>,
+    hasPhonePermission: Boolean,
+    onSourceSelected: (RecordingSourceOption) -> Unit,
+    onCallTest: () -> Unit,
+    onRefreshCalls: () -> Unit,
+    onRequestPermissions: () -> Unit
+) {
+    SectionTitle("Запись звонка")
+    FeaturePanel(
+        title = "Режим проверки разговора",
+        body = "Во время звонка включите громкую связь, запустите проверку и смотрите на уровень звука. Если уровень остается 0, Android или прошивка Huawei не отдает аудио звонка стороннему приложению."
+    )
+
+    RecordingSourcePicker(
+        selectedSource = selectedSource,
+        enabled = !isRecording,
+        onSelect = onSourceSelected
+    )
+
+    Button(
+        onClick = onCallTest,
+        modifier = Modifier.fillMaxWidth().height(54.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = if (isRecording) Wine else Gold)
+    ) {
+        Text(if (isRecording) "Завершить проверку" else "Проверить звонок", color = Ink, fontWeight = FontWeight.Bold)
+    }
+
+    DiagnosticsPanel(lastAmplitude = lastAmplitude)
+
+    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        OutlinedButton(onClick = onRefreshCalls, modifier = Modifier.weight(1f)) {
+            Text("Обновить")
+        }
+        OutlinedButton(onClick = onRequestPermissions, modifier = Modifier.weight(1f), enabled = !hasPhonePermission) {
+            Text("Разрешения")
+        }
+    }
+
+    SectionTitle("События звонков")
+    if (callEvents.isEmpty()) {
+        EmptyPanel("Событий пока нет. Разрешите доступ к состоянию телефона и сделайте тестовый звонок.")
+    } else {
+        callEvents.take(8).forEach {
+            Text(it, color = SoftText, fontSize = 14.sp, lineHeight = 19.sp)
+            HorizontalDivider(color = Line)
+        }
+    }
+}
+
+@Composable
+private fun NotesTab(
+    noteText: String,
+    notes: List<String>,
+    onNoteChanged: (String) -> Unit,
+    onSaveNote: () -> Unit
+) {
+    SectionTitle("Заметки")
+    OutlinedTextField(
+        value = noteText,
+        onValueChange = onNoteChanged,
+        modifier = Modifier.fillMaxWidth(),
+        label = { Text("Заметка к разговору") },
+        minLines = 5
+    )
+    Button(
+        onClick = onSaveNote,
+        modifier = Modifier.fillMaxWidth().height(50.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = Steel)
+    ) {
+        Text("Сохранить заметку", color = Color.White, fontWeight = FontWeight.Bold)
+    }
+
+    if (notes.isEmpty()) {
+        EmptyPanel("Заметок пока нет. Сюда попадут ручные итоги разговоров.")
+    } else {
+        notes.take(12).forEach {
+            Text(it, color = SoftText, fontSize = 14.sp, lineHeight = 19.sp)
+            HorizontalDivider(color = Line)
+        }
+    }
+}
+
+@Composable
+private fun AiTab(
+    recordings: List<File>,
+    notes: List<String>,
+    aiDraft: String,
+    speechText: String,
+    onStartSpeech: () -> Unit,
+    onSaveSpeech: () -> Unit,
+    onBuildDraft: () -> Unit
+) {
+    SectionTitle("AI-анализ")
+    FeaturePanel(
+        title = "Распознавание речи",
+        body = "Нажмите кнопку и продиктуйте текст. Android вернет распознанную речь, а CallNote AI сохранит ее в заметки и подготовит черновик анализа."
+    )
+    Button(
+        onClick = onStartSpeech,
+        modifier = Modifier.fillMaxWidth().height(52.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = Gold)
+    ) {
+        Text("Распознать речь", color = Ink, fontWeight = FontWeight.Bold)
+    }
+    if (speechText.isNotBlank()) {
+        FeaturePanel(title = "Распознанный текст", body = speechText)
+        OutlinedButton(
+            onClick = onSaveSpeech,
+            modifier = Modifier.fillMaxWidth().height(50.dp)
+        ) {
+            Text("Сохранить в заметки")
+        }
+    }
+    InfoLine("Последняя запись", recordings.firstOrNull()?.name ?: "нет записей")
+    InfoLine("Последняя заметка", notes.firstOrNull() ?: "нет заметок")
+    Button(
+        onClick = onBuildDraft,
+        modifier = Modifier.fillMaxWidth().height(52.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = Steel)
+    ) {
+        Text("Подготовить AI-черновик", color = Color.White, fontWeight = FontWeight.Bold)
+    }
+    if (aiDraft.isNotBlank()) {
+        FeaturePanel(title = "Черновик", body = aiDraft)
+    }
+}
+
+@Composable
+private fun SettingsTab(
+    context: Context,
+    hasAudioPermission: Boolean,
+    hasPhonePermission: Boolean,
+    hasNotificationPermission: Boolean,
+    onRequestPermissions: () -> Unit
+) {
+    SectionTitle("Настройки")
+    InfoLine("Микрофон", if (hasAudioPermission) "разрешен" else "нужно разрешить")
+    InfoLine("Состояние телефона", if (hasPhonePermission) "разрешено" else "нужно разрешить")
+    InfoLine("Уведомления", if (hasNotificationPermission) "разрешены" else "нужно разрешить")
+    InfoLine("Папка записей", recordingsDir(context).absolutePath)
+
+    Button(
+        onClick = onRequestPermissions,
+        modifier = Modifier.fillMaxWidth().height(52.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = Steel)
+    ) {
+        Text("Проверить разрешения", color = Color.White, fontWeight = FontWeight.Bold)
+    }
+
+    FeaturePanel(
+        title = "Ограничение Android",
+        body = "Обычное приложение может записывать микрофон, но не имеет системного доступа к внутреннему аудио звонка. Поэтому на Android 10+ и особенно Android 14 голос собеседника часто доступен только через громкую связь или штатную запись производителя."
+    )
+}
+
+@Composable
+private fun RecordingSourcePicker(
+    selectedSource: RecordingSourceOption,
+    enabled: Boolean,
+    onSelect: (RecordingSourceOption) -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        recordingSourceOptions().forEach { option ->
+            val isSelected = selectedSource == option
+            OutlinedButton(
+                onClick = { onSelect(option) },
+                enabled = enabled,
+                modifier = Modifier.fillMaxWidth().height(58.dp),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = if (isSelected) Gold.copy(alpha = 0.16f) else Color.Transparent,
+                    contentColor = if (isSelected) Gold else SoftText
+                )
+            ) {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalAlignment = Alignment.Start
+                ) {
+                    Text(option.title, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    Text(option.description, fontSize = 12.sp, lineHeight = 15.sp)
+                }
+            }
         }
     }
 }
@@ -412,6 +825,20 @@ private fun RecordingRow(
 }
 
 @Composable
+private fun DiagnosticsPanel(lastAmplitude: Int) {
+    val result = when {
+        lastAmplitude == 0 -> "Сигнала нет: попробуйте громкую связь и другой источник."
+        lastAmplitude < 600 -> "Сигнал слабый: поднесите телефон ближе или включите громкую связь."
+        else -> "Сигнал есть: запись должна содержать слышимый голос."
+    }
+
+    FeaturePanel(
+        title = "Диагностика звука",
+        body = "Текущий уровень: $lastAmplitude\n$result"
+    )
+}
+
+@Composable
 private fun SectionTitle(text: String) {
     Text(text, color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
 }
@@ -436,6 +863,36 @@ private fun FeaturePanel(title: String, body: String) {
     }
 }
 
+@Composable
+private fun InfoLine(label: String, value: String) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Panel),
+        shape = RoundedCornerShape(8.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(Modifier.padding(14.dp)) {
+            Text(label, color = Gold, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(4.dp))
+            Text(value, color = Color.White, fontSize = 14.sp, lineHeight = 19.sp)
+        }
+    }
+}
+
+private fun hasPermission(context: Context, permission: String): Boolean {
+    return ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+}
+
+private fun requiredPermissions(): Array<String> {
+    val permissions = mutableListOf(
+        Manifest.permission.RECORD_AUDIO,
+        Manifest.permission.READ_PHONE_STATE
+    )
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        permissions += Manifest.permission.POST_NOTIFICATIONS
+    }
+    return permissions.toTypedArray()
+}
+
 private fun recordingsDir(context: Context): File {
     return File(context.getExternalFilesDir(Environment.DIRECTORY_MUSIC), "CallNoteAI").apply {
         mkdirs()
@@ -444,6 +901,14 @@ private fun recordingsDir(context: Context): File {
 
 private fun notesFile(context: Context): File {
     return File(context.filesDir, "callnote_notes.txt")
+}
+
+private fun callEventsFile(context: Context): File {
+    return File(context.filesDir, "callnote_call_events.txt")
+}
+
+private fun aiDraftsFile(context: Context): File {
+    return File(context.filesDir, "callnote_ai_draft.txt")
 }
 
 private fun timestampForFile(): String {
@@ -467,6 +932,61 @@ private fun formatTimer(totalSeconds: Int): String {
 private fun formatFileSize(bytes: Long): String {
     val kb = bytes / 1024
     return if (kb < 1024) "$kb КБ" else "${kb / 1024} МБ"
+}
+
+private enum class AppTab(val title: String) {
+    Recorder("Диктофон"),
+    Calls("Звонки"),
+    Notes("Заметки"),
+    Ai("AI"),
+    Settings("Настройки")
+}
+
+private data class RecordingSourceOption(
+    val title: String,
+    val description: String,
+    val filePrefix: String,
+    val audioSource: Int
+)
+
+private fun recordingSourceOptions(): List<RecordingSourceOption> {
+    val options = mutableListOf(
+        RecordingSourceOption(
+            title = "Голосовая связь",
+            description = "Первым пробовать во время звонка",
+            filePrefix = "voice_comm",
+            audioSource = MediaRecorder.AudioSource.VOICE_COMMUNICATION
+        ),
+        RecordingSourceOption(
+            title = "Микрофон",
+            description = "Обычный диктофон и громкая связь",
+            filePrefix = "mic",
+            audioSource = MediaRecorder.AudioSource.MIC
+        ),
+        RecordingSourceOption(
+            title = "Распознавание",
+            description = "Чистый голос, иногда лучше на Huawei",
+            filePrefix = "voice_rec",
+            audioSource = MediaRecorder.AudioSource.VOICE_RECOGNITION
+        ),
+        RecordingSourceOption(
+            title = "Камера",
+            description = "Альтернативный микрофонный профиль",
+            filePrefix = "camcorder",
+            audioSource = MediaRecorder.AudioSource.CAMCORDER
+        )
+    )
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+        options += RecordingSourceOption(
+            title = "Без обработки",
+            description = "Сырой микрофон, если устройство поддерживает",
+            filePrefix = "raw",
+            audioSource = MediaRecorder.AudioSource.UNPROCESSED
+        )
+    }
+
+    return options
 }
 
 private val Ink = Color(0xFF080A0B)
