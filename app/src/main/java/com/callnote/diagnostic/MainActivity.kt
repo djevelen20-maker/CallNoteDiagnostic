@@ -51,6 +51,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.Slider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -207,6 +208,8 @@ private fun CallNoteHome(
     var elapsedSeconds by remember { mutableIntStateOf(0) }
     var lastAmplitude by remember { mutableIntStateOf(0) }
     var nowPlaying by remember { mutableStateOf<String?>(null) }
+    var playbackPosition by remember { mutableIntStateOf(0) }
+    var playbackDuration by remember { mutableIntStateOf(0) }
     var status by remember { mutableStateOf("Готов к записи, заметкам и проверке звонка") }
     var noteText by remember { mutableStateOf("") }
     var selectedSource by remember { mutableStateOf(recordingSourceOptions().first()) }
@@ -329,6 +332,13 @@ private fun CallNoteHome(
         }
     }
 
+    LaunchedEffect(nowPlaying) {
+        while (nowPlaying != null) {
+            playbackPosition = runCatching { player?.currentPosition ?: 0 }.getOrDefault(0)
+            delay(250)
+        }
+    }
+
     DisposableEffect(Unit) {
         onDispose {
             runCatching { recorder?.stop() }
@@ -341,6 +351,8 @@ private fun CallNoteHome(
         player?.release()
         player = null
         nowPlaying = null
+        playbackPosition = 0
+        playbackDuration = 0
     }
 
     fun stopRecording() {
@@ -405,6 +417,8 @@ private fun CallNoteHome(
                     it.release()
                     player = null
                     nowPlaying = null
+                    playbackPosition = 0
+                    playbackDuration = 0
                     status = "Прослушивание завершено"
                 }
                 start()
@@ -412,6 +426,8 @@ private fun CallNoteHome(
         }.onSuccess {
             player = it
             nowPlaying = file.name
+            playbackPosition = 0
+            playbackDuration = it.duration.coerceAtLeast(0)
             status = "Воспроизведение: ${file.name}"
         }.onFailure {
             status = "Не удалось воспроизвести запись"
@@ -569,16 +585,17 @@ private fun CallNoteHome(
             when (selectedTab) {
                 AppTab.Recorder -> RecorderTab(
                     recordings = recordings,
-                    selectedSource = selectedSource,
                     isRecording = isRecording,
                     nowPlaying = nowPlaying,
-                    onSourceSelected = { selectedSource = it },
                     onRecord = { if (isRecording) stopRecording() else startRecording() },
                     onStopPlayer = {
                         stopPlayer()
                         status = "Воспроизведение остановлено"
                     },
                     onPlay = ::playRecording,
+                    playbackPosition = playbackPosition,
+                    playbackDuration = playbackDuration,
+                    onSeek = { position -> player?.seekTo(position) },
                     onDelete = {
                         if (nowPlaying == it.name) stopPlayer()
                         it.delete()
@@ -588,13 +605,10 @@ private fun CallNoteHome(
                 )
 
                 AppTab.Calls -> CallsTab(
-                    selectedSource = selectedSource,
                     isRecording = isRecording,
                     lastAmplitude = lastAmplitude,
                     callEvents = callEvents,
                     hasPhonePermission = hasPhonePermission,
-                    onSourceSelected = { selectedSource = it },
-                    onCallTest = { if (isRecording) stopRecording() else startRecording(callMode = true) },
                     onRefreshCalls = {
                         refreshCalls()
                         status = "Журнал звонков обновлен"
@@ -698,7 +712,7 @@ private fun StatusCard(isRecording: Boolean, elapsedSeconds: Int, lastAmplitude:
         modifier = Modifier.fillMaxWidth()
     ) {
         Column(Modifier.padding(16.dp)) {
-            Text(if (isRecording) "Запись идет" else "Диктофон готов", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            Text(if (isRecording) "●  ИДЕТ ЗАПИСЬ" else "Диктофон готов", color = if (isRecording) Wine else Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(8.dp))
             Text(formatTimer(elapsedSeconds), color = if (isRecording) Gold else SoftText, fontSize = 34.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(8.dp))
@@ -726,22 +740,16 @@ private fun StatusCard(isRecording: Boolean, elapsedSeconds: Int, lastAmplitude:
 @Composable
 private fun RecorderTab(
     recordings: List<File>,
-    selectedSource: RecordingSourceOption,
     isRecording: Boolean,
     nowPlaying: String?,
-    onSourceSelected: (RecordingSourceOption) -> Unit,
     onRecord: () -> Unit,
     onStopPlayer: () -> Unit,
     onPlay: (File) -> Unit,
+    playbackPosition: Int,
+    playbackDuration: Int,
+    onSeek: (Int) -> Unit,
     onDelete: (File) -> Unit
 ) {
-    SectionTitle("Источник записи")
-    RecordingSourcePicker(
-        selectedSource = selectedSource,
-        enabled = !isRecording,
-        onSelect = onSourceSelected
-    )
-
     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         Button(
             onClick = onRecord,
@@ -769,6 +777,9 @@ private fun RecorderTab(
                 file = file,
                 isPlaying = nowPlaying == file.name,
                 onPlay = { onPlay(file) },
+                playbackPosition = if (nowPlaying == file.name) playbackPosition else 0,
+                playbackDuration = if (nowPlaying == file.name) playbackDuration else 0,
+                onSeek = onSeek,
                 onDelete = { onDelete(file) }
             )
         }
@@ -777,13 +788,10 @@ private fun RecorderTab(
 
 @Composable
 private fun CallsTab(
-    selectedSource: RecordingSourceOption,
     isRecording: Boolean,
     lastAmplitude: Int,
     callEvents: List<String>,
     hasPhonePermission: Boolean,
-    onSourceSelected: (RecordingSourceOption) -> Unit,
-    onCallTest: () -> Unit,
     onRefreshCalls: () -> Unit,
     onRequestPermissions: () -> Unit
 ) {
@@ -792,20 +800,6 @@ private fun CallsTab(
         title = "Режим проверки разговора",
         body = "Во время звонка включите громкую связь, запустите проверку и смотрите на уровень звука. Если уровень остается 0, Android или прошивка Huawei не отдает аудио звонка стороннему приложению."
     )
-
-    RecordingSourcePicker(
-        selectedSource = selectedSource,
-        enabled = !isRecording,
-        onSelect = onSourceSelected
-    )
-
-    Button(
-        onClick = onCallTest,
-        modifier = Modifier.fillMaxWidth().height(54.dp),
-        colors = ButtonDefaults.buttonColors(containerColor = if (isRecording) Wine else Gold)
-    ) {
-        Text(if (isRecording) "Завершить проверку" else "Проверить звонок", color = Ink, fontWeight = FontWeight.Bold)
-    }
 
     DiagnosticsPanel(lastAmplitude = lastAmplitude)
 
@@ -990,6 +984,9 @@ private fun RecordingRow(
     file: File,
     isPlaying: Boolean,
     onPlay: () -> Unit,
+    playbackPosition: Int,
+    playbackDuration: Int,
+    onSeek: (Int) -> Unit,
     onDelete: () -> Unit
 ) {
     Card(
@@ -1000,6 +997,15 @@ private fun RecordingRow(
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text(file.name, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
             Text("${formatFileSize(file.length())} - ${timestampFromFile(file)}", color = SoftText, fontSize = 13.sp)
+            if (isPlaying && playbackDuration > 0) {
+                Slider(
+                    value = playbackPosition.toFloat().coerceIn(0f, playbackDuration.toFloat()),
+                    onValueChange = { onSeek(it.toInt()) },
+                    valueRange = 0f..playbackDuration.toFloat(),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Text("${formatPlaybackTime(playbackPosition)} / ${formatPlaybackTime(playbackDuration)}", color = SoftText, fontSize = 12.sp)
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Button(
                     onClick = onPlay,
@@ -1125,6 +1131,11 @@ private fun formatTimer(totalSeconds: Int): String {
     val minutes = totalSeconds / 60
     val seconds = totalSeconds % 60
     return "%02d:%02d".format(minutes, seconds)
+}
+
+private fun formatPlaybackTime(milliseconds: Int): String {
+    val totalSeconds = (milliseconds / 1000).coerceAtLeast(0)
+    return "%02d:%02d".format(totalSeconds / 60, totalSeconds % 60)
 }
 
 private fun formatFileSize(bytes: Long): String {
