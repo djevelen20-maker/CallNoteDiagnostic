@@ -1,6 +1,5 @@
 package com.callnote.diagnostic
 
-import android.content.Context
 import android.telecom.Call
 import android.telecom.InCallService
 import java.io.File
