@@ -12,7 +12,7 @@ class OfflineWhisperTranscriber(private val context: Context) {
         val model = copyAsset("whisper-tiny.tflite")
         val vocab = copyAsset("filters_vocab_multilingual.bin")
         engine.setListener(object : Whisper.WhisperListener {
-            override fun onUpdateReceived(message: String) = onUpdate(message)
+            override fun onUpdateReceived(message: String) = onUpdate(message.toRussianStatus())
             override fun onResultReceived(result: String) = onResult(result.orEmpty())
         })
         engine.loadModel(model, vocab, true)
@@ -33,6 +33,15 @@ class OfflineWhisperTranscriber(private val context: Context) {
             context.assets.open(name).use { input -> file.outputStream().use { input.copyTo(it) } }
         }
         return file
+    }
+
+    private fun String.toRussianStatus(): String = when {
+        contains("Processing done", ignoreCase = true) -> "Расшифровка завершена"
+        contains("Processing", ignoreCase = true) -> "Whisper анализирует аудио..."
+        contains("not found", ignoreCase = true) -> "Аудиофайл не найден"
+        contains("not initialized", ignoreCase = true) -> "Модель Whisper не загрузилась"
+        contains("failed", ignoreCase = true) -> "Ошибка обработки аудио"
+        else -> this
     }
 }
 
