@@ -82,6 +82,10 @@ object AudioFileConverter {
                     (mono[left] + (mono[right] - mono[left]) * (position - left)).toFloat()
                 }
             }
+            val peak = outputSamples.maxOfOrNull { kotlin.math.abs(it) } ?: 0f
+            require(outputSamples.isNotEmpty() && peak >= 0.003f) {
+                "В записи не найден голос: аудиосигнал пустой"
+            }
             val outputBytes = ByteArray(outputSamples.size * 2)
             val target = ByteBuffer.wrap(outputBytes).order(ByteOrder.LITTLE_ENDIAN)
             outputSamples.forEach { target.putShort((it.coerceIn(-1f, 1f) * 32767).toInt().toShort()) }
