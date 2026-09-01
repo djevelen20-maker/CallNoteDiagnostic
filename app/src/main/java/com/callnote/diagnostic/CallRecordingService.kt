@@ -46,9 +46,11 @@ class CallRecordingService : Service() {
         runCatching { mediaRecorder.start() }.onSuccess {
             recorder = mediaRecorder
             outputFile = file
+            CallRecordingState.isActive = true
             updateNotification("Идет запись звонка")
             appendEvent("Запись звонка началась: ${file.name}")
         }.onFailure {
+            CallRecordingState.isActive = false
             mediaRecorder.release()
             appendEvent("Запись звонка не началась: ${it.localizedMessage ?: "доступ к микрофону закрыт"}")
             stopSelf()
@@ -96,6 +98,7 @@ class CallRecordingService : Service() {
         runCatching { current.stop() }
         current.release()
         recorder = null
+        CallRecordingState.isActive = false
         outputFile?.let { appendEvent("Запись звонка сохранена: ${it.name}") }
         outputFile = null
         stopForeground(STOP_FOREGROUND_REMOVE)
