@@ -223,14 +223,16 @@ private fun CallNoteHome(
     var playbackDuration by remember { mutableIntStateOf(0) }
     var status by remember { mutableStateOf("Готов к записи, заметкам и проверке звонка") }
     var noteText by remember { mutableStateOf("") }
-    var selectedSource by remember { mutableStateOf(recordingSourceOptions().first()) }
+    // A manual dictation must use the microphone. Call-only sources are often silent
+    // outside an active call, especially on Huawei firmware.
+    var selectedSource by remember { mutableStateOf(recordingSourceOptions().first { it.audioSource == MediaRecorder.AudioSource.MIC }) }
     var selectedTab by remember { mutableStateOf(AppTab.Phone) }
     var dialNumber by remember { mutableStateOf((context as? Activity)?.intent?.data?.schemeSpecificPart.orEmpty()) }
     var callState by remember { mutableIntStateOf(Call.STATE_DISCONNECTED) }
     var aiDraft by remember { mutableStateOf("") }
     var speechText by remember { mutableStateOf("") }
     var transcriptionFile by remember { mutableStateOf<String?>(null) }
-    var audioSourceDescriptor: ParcelFileDescriptor? = null
+    val audioSourceDescriptor = remember { mutableStateOf<ParcelFileDescriptor?>(null) }
     val speechRecognizer = remember(context) {
         if (SpeechRecognizer.isRecognitionAvailable(context)) {
             SpeechRecognizer.createSpeechRecognizer(context)
@@ -245,8 +247,8 @@ private fun CallNoteHome(
     val speechLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        audioSourceDescriptor?.close()
-        audioSourceDescriptor = null
+        audioSourceDescriptor.value?.close()
+        audioSourceDescriptor.value = null
         if (result.resultCode == Activity.RESULT_OK) {
             val matches = result.data
                 ?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
@@ -513,6 +515,7 @@ private fun CallNoteHome(
             stopRecording()
             status = "Запись сохранена. Теперь говорите для расшифровки"
         }
+        speechRecognizer?.cancel()
         speechText = ""
         transcriptionFile = null
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
@@ -545,14 +548,15 @@ private fun CallNoteHome(
             return
         }
         runCatching {
-            audioSourceDescriptor?.close()
-            audioSourceDescriptor = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+            audioSourceDescriptor.value?.close()
+            audioSourceDescriptor.value = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
             transcriptionFile = file.name
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
                 putExtra(RecognizerIntent.EXTRA_PROMPT, "Расшифровка записи CallNote AI")
-                putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, audioSourceDescriptor)
+                putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+                putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, audioSourceDescriptor.value)
                 putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
                 putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, 44_100)
                 putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, 2)
@@ -560,8 +564,8 @@ private fun CallNoteHome(
             speechLauncher.launch(intent)
             status = "Расшифровка аудио началась"
         }.onFailure {
-            audioSourceDescriptor?.close()
-            audioSourceDescriptor = null
+            audioSourceDescriptor.value?.close()
+            audioSourceDescriptor.value = null
             transcriptionFile = null
             status = "Не удалось открыть аудиофайл для расшифровки"
         }
