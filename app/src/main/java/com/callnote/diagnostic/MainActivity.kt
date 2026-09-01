@@ -46,6 +46,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -90,6 +91,10 @@ class MainActivity : ComponentActivity() {
 
 private object ActiveCallController {
     var call: Call? = null
+}
+
+internal object CallRecordingState {
+    @Volatile var isActive: Boolean = false
 }
 
 class CallStateReceiver : BroadcastReceiver() {
@@ -190,7 +195,7 @@ private fun CallNoteApp() {
         }
     }
 
-    MaterialTheme {
+    MaterialTheme(colorScheme = AppColors) {
         Surface(color = Ink) {
             CallNoteHome(
                 context = context,
@@ -229,6 +234,7 @@ private fun CallNoteHome(
     var selectedTab by remember { mutableStateOf(AppTab.Phone) }
     var dialNumber by remember { mutableStateOf((context as? Activity)?.intent?.data?.schemeSpecificPart.orEmpty()) }
     var callState by remember { mutableIntStateOf(Call.STATE_DISCONNECTED) }
+    var callRecordingActive by remember { mutableStateOf(CallRecordingState.isActive) }
     var aiDraft by remember { mutableStateOf("") }
     var speechText by remember { mutableStateOf("") }
     var transcriptionFile by remember { mutableStateOf<String?>(null) }
@@ -339,6 +345,7 @@ private fun CallNoteHome(
     LaunchedEffect(Unit) {
         while (true) {
             callState = ActiveCallController.call?.state ?: Call.STATE_DISCONNECTED
+            callRecordingActive = CallRecordingState.isActive
             delay(500)
         }
     }
@@ -615,6 +622,7 @@ private fun CallNoteHome(
             TabBar(selectedTab = selectedTab, onSelect = { selectedTab = it })
             StatusCard(
                 isRecording = isRecording,
+                isCallRecording = callRecordingActive,
                 elapsedSeconds = elapsedSeconds,
                 lastAmplitude = lastAmplitude,
                 status = status
@@ -651,7 +659,7 @@ private fun CallNoteHome(
                 )
 
                 AppTab.Calls -> CallsTab(
-                    isRecording = isRecording,
+                    isRecording = callRecordingActive,
                     lastAmplitude = lastAmplitude,
                     callEvents = callEvents,
                     hasPhonePermission = hasPhonePermission,
@@ -749,7 +757,8 @@ private fun TabBar(selectedTab: AppTab, onSelect: (AppTab) -> Unit) {
 }
 
 @Composable
-private fun StatusCard(isRecording: Boolean, elapsedSeconds: Int, lastAmplitude: Int, status: String) {
+private fun StatusCard(isRecording: Boolean, isCallRecording: Boolean, elapsedSeconds: Int, lastAmplitude: Int, status: String) {
+    val recordingNow = isRecording || isCallRecording
     val level = if (isRecording) (lastAmplitude / 32767f).coerceIn(0.02f, 1f) else 0f
 
     Card(
@@ -758,9 +767,18 @@ private fun StatusCard(isRecording: Boolean, elapsedSeconds: Int, lastAmplitude:
         modifier = Modifier.fillMaxWidth()
     ) {
         Column(Modifier.padding(16.dp)) {
-            Text(if (isRecording) "●  ИДЕТ ЗАПИСЬ" else "Диктофон готов", color = if (isRecording) Wine else Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            Text(
+                when {
+                    isCallRecording -> "●  ИДЕТ ЗАПИСЬ ЗВОНКА"
+                    isRecording -> "●  ИДЕТ ЗАПИСЬ"
+                    else -> "Диктофон готов"
+                },
+                color = if (recordingNow) Wine else Color.White,
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Bold
+            )
             Spacer(Modifier.height(8.dp))
-            Text(formatTimer(elapsedSeconds), color = if (isRecording) Gold else SoftText, fontSize = 34.sp, fontWeight = FontWeight.Bold)
+            Text(formatTimer(elapsedSeconds), color = if (recordingNow) Gold else SoftText, fontSize = 34.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(8.dp))
             Box(
                 modifier = Modifier
@@ -886,6 +904,10 @@ private fun CallsTab(
     onRequestPermissions: () -> Unit
 ) {
     SectionTitle("Запись звонка")
+    FeaturePanel(
+        title = if (isRecording) "● Запись звонка идет" else "Запись включается автоматически",
+        body = if (isRecording) "Сервис CallNote AI сейчас записывает разговор. После завершения вызова файл появится во вкладке «Диктофон»." else "После ответа на звонок запись запускается автоматически. Во время разговора смотрите этот статус и уведомление в шторке."
+    )
     FeaturePanel(
         title = "Режим проверки разговора",
         body = "Во время звонка включите громкую связь, запустите проверку и смотрите на уровень звука. Если уровень остается 0, Android или прошивка Huawei не отдает аудио звонка стороннему приложению."
@@ -1298,4 +1320,18 @@ private val Steel = Color(0xFF2D6F88)
 private val Wine = Color(0xFFC85C5C)
 private val SoftText = Color(0xFFC9D1CE)
 private val Line = Color(0xFF34413F)
+
+private val AppColors = darkColorScheme(
+    primary = Gold,
+    onPrimary = Ink,
+    secondary = Steel,
+    onSecondary = Color.White,
+    background = Ink,
+    onBackground = Color.White,
+    surface = Panel,
+    onSurface = Color.White,
+    surfaceVariant = Color(0xFF20272A),
+    onSurfaceVariant = SoftText,
+    outline = Color(0xFF83918E)
+)
 
