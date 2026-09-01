@@ -21,6 +21,8 @@ import android.telephony.TelephonyManager
 import android.telecom.Call
 import android.telecom.InCallService
 import android.telecom.TelecomManager
+import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -183,6 +185,7 @@ private fun CallNoteApp() {
         hasCallPermission = hasPermission(context, Manifest.permission.CALL_PHONE)
         hasNotificationPermission = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
             hasPermission(context, Manifest.permission.POST_NOTIFICATIONS)
+        Toast.makeText(context, "Разрешения обновлены", Toast.LENGTH_SHORT).show()
     }
 
     fun requestPermissions() {
@@ -309,6 +312,7 @@ private fun CallNoteHome(
         } else {
             "Роль приложения телефона не выдана"
         }
+        Toast.makeText(context, status, Toast.LENGTH_LONG).show()
     }
 
     fun refreshRecordings() {
@@ -536,11 +540,14 @@ private fun CallNoteHome(
         runCatching {
             if (speechRecognizer == null) {
                 status = "На телефоне нет голосового сервиса. Установите или включите Google Voice Input"
+                Toast.makeText(context, status, Toast.LENGTH_LONG).show()
             } else {
                 speechRecognizer.startListening(intent)
+                Toast.makeText(context, "Говорите, идет распознавание", Toast.LENGTH_SHORT).show()
             }
         }.onFailure {
             status = "Не удалось запустить распознавание: ${it.localizedMessage ?: "проверьте микрофон"}"
+            Toast.makeText(context, status, Toast.LENGTH_LONG).show()
         }
     }
 
@@ -599,11 +606,12 @@ private fun CallNoteHome(
             }
         }
 
-        runCatching {
-            dialerRoleLauncher.launch(intent)
-        }.onFailure {
-            status = "Телефон не разрешил запрос роли звонилки"
-        }
+        runCatching { dialerRoleLauncher.launch(intent) }
+            .onFailure {
+                status = "Откройте настройки приложений телефона"
+                Toast.makeText(context, status, Toast.LENGTH_LONG).show()
+                context.startActivity(Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
+            }
     }
 
     Box(
@@ -904,13 +912,10 @@ private fun CallsTab(
     onRequestPermissions: () -> Unit
 ) {
     SectionTitle("Запись звонка")
-    FeaturePanel(
-        title = if (isRecording) "● Запись звонка идет" else "Запись включается автоматически",
-        body = if (isRecording) "Сервис CallNote AI сейчас записывает разговор. После завершения вызова файл появится во вкладке «Диктофон»." else "После ответа на звонок запись запускается автоматически. Во время разговора смотрите этот статус и уведомление в шторке."
-    )
-    FeaturePanel(
-        title = "Режим проверки разговора",
-        body = "Во время звонка включите громкую связь, запустите проверку и смотрите на уровень звука. Если уровень остается 0, Android или прошивка Huawei не отдает аудио звонка стороннему приложению."
+    Text(
+        if (isRecording) "● Запись звонка идет. Файл появится в «Диктофоне»." else "Запись запускается сама после ответа на звонок.",
+        color = if (isRecording) Wine else SoftText,
+        fontSize = 15.sp
     )
 
     DiagnosticsPanel(lastAmplitude = lastAmplitude)
@@ -980,10 +985,6 @@ private fun AiTab(
     onBuildDraft: () -> Unit
 ) {
     SectionTitle("AI-анализ")
-    FeaturePanel(
-        title = "Распознавание речи",
-        body = "Нажмите кнопку и продиктуйте текст. Android вернет распознанную речь, а CallNote AI сохранит ее в заметки и подготовит черновик анализа."
-    )
     Button(
         onClick = onStartSpeech,
         modifier = Modifier.fillMaxWidth().height(52.dp),
@@ -1055,10 +1056,6 @@ private fun SettingsTab(
         Text("Встроить в звонилку", color = Ink, fontWeight = FontWeight.Bold)
     }
 
-    FeaturePanel(
-        title = "Ограничение Android",
-        body = "CallNote AI может запросить роль приложения телефона и получать события звонка через Telecom. Но внутренний звук разговора закрыт системным разрешением, которое обычному APK не выдается. Поэтому роль звонилки помогает встроиться в звонок, но не гарантирует запись собеседника."
-    )
 }
 
 @Composable
