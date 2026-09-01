@@ -919,7 +919,7 @@ private fun CallsTab(
         OutlinedButton(onClick = onRefreshCalls, modifier = Modifier.weight(1f)) {
             Text("Обновить")
         }
-        OutlinedButton(onClick = onRequestPermissions, modifier = Modifier.weight(1f), enabled = !hasPhonePermission) {
+        OutlinedButton(onClick = onRequestPermissions, modifier = Modifier.weight(1f)) {
             Text("Разрешения")
         }
     }
