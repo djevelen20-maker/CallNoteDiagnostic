@@ -24,6 +24,12 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Download Whisper model assets
+        run: |
+          mkdir -p app/src/main/assets
+          curl -L --fail --retry 3 https://raw.githubusercontent.com/vilassn/whisper_android/master/whisper_java/app/src/main/assets/whisper-tiny.tflite -o app/src/main/assets/whisper-tiny.tflite
+          curl -L --fail --retry 3 https://raw.githubusercontent.com/vilassn/whisper_android/master/whisper_java/app/src/main/assets/filters_vocab_multilingual.bin -o app/src/main/assets/filters_vocab_multilingual.bin
+
       - name: Build APK
         run: |
           gradle assembleDebug --stacktrace \
@@ -36,3 +42,4 @@ jobs:
           name: CallNote-AI-debug-apk
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+
