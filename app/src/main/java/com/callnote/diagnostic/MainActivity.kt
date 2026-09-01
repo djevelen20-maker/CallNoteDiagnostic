@@ -14,6 +14,8 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.ParcelFileDescriptor
+import android.os.Handler
+import android.os.Looper
 import android.speech.RecognizerIntent
 import android.speech.RecognitionListener
 import android.speech.SpeechRecognizer
@@ -249,6 +251,7 @@ private fun CallNoteHome(
             null
         }
     }
+    val offlineWhisper = remember(context) { OfflineWhisperTranscriber(context) }
     val recordings = remember { mutableStateListOf<File>() }
     val notes = remember { mutableStateListOf<String>() }
     val callEvents = remember { mutableStateListOf<String>() }
@@ -391,6 +394,7 @@ private fun CallNoteHome(
             runCatching { recorder?.stop() }
             recorder?.release()
             player?.release()
+            offlineWhisper.close()
         }
     }
 
@@ -557,32 +561,28 @@ private fun CallNoteHome(
             status = "Разрешите доступ к микрофону для расшифровки"
             return
         }
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-            status = "Расшифровка файла доступна на Android 12 и новее"
-            return
-        }
-        runCatching {
-            audioSourceDescriptor.value?.close()
-            audioSourceDescriptor.value = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
-            transcriptionFile = file.name
-            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
-                putExtra(RecognizerIntent.EXTRA_PROMPT, "Расшифровка записи CallNote AI")
-                putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
-                putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, audioSourceDescriptor.value)
-                putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
-                putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, 44_100)
-                putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, 2)
+        transcriptionFile = file.name
+        speechText = ""
+        status = "Подготовка аудио для Whisper..."
+        Thread {
+            val wav = File(context.cacheDir, "${file.nameWithoutExtension}_whisper.wav")
+            runCatching {
+                AudioFileConverter.toWhisperWav(file, wav)
+                Handler(Looper.getMainLooper()).post { status = "Whisper расшифровывает запись..." }
+                offlineWhisper.transcribe(
+                    wav,
+                    onUpdate = { message -> Handler(Looper.getMainLooper()).post { status = message } },
+                    onResult = { result -> Handler(Looper.getMainLooper()).post {
+                        speechText = result.trim()
+                        status = if (speechText.isBlank()) "Whisper не нашел речи в записи" else "Расшифровка готова"
+                    } }
+                )
+            }.onFailure {
+                Handler(Looper.getMainLooper()).post {
+                    status = "Не удалось расшифровать запись: ${it.localizedMessage ?: "проверьте, что в записи есть голос"}"
+                }
             }
-            speechLauncher.launch(intent)
-            status = "Расшифровка аудио началась"
-        }.onFailure {
-            audioSourceDescriptor.value?.close()
-            audioSourceDescriptor.value = null
-            transcriptionFile = null
-            status = "Не удалось открыть аудиофайл для расшифровки"
-        }
+        }.start()
     }
 
     fun saveSpeechAsNote() {
