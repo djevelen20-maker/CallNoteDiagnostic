@@ -117,6 +117,21 @@ class CallStateReceiver : BroadcastReceiver() {
             else -> "Состояние звонка изменилось"
         }
 
+        if (rawState == TelephonyManager.EXTRA_STATE_OFFHOOK) {
+            runCatching {
+                ContextCompat.startForegroundService(
+                    context,
+                    Intent(context, CallRecordingService::class.java).setAction(CallRecordingService.ACTION_START)
+                )
+            }.onFailure {
+                callEventsFile(context).appendText("${timestampForNote()} - Автозапись не запущена: ${it.localizedMessage}\n")
+            }
+        } else if (rawState == TelephonyManager.EXTRA_STATE_IDLE) {
+            runCatching {
+                context.startService(Intent(context, CallRecordingService::class.java).setAction(CallRecordingService.ACTION_STOP))
+            }
+        }
+
         runCatching {
             callEventsFile(context).appendText("${timestampForNote()} - $state\n")
         }
@@ -142,6 +157,13 @@ class CallNoteInCallService : InCallService() {
         }
         runCatching {
             callEventsFile(this).appendText("${timestampForNote()} - Звонок открыт в CallNote AI\n")
+        }
+        runCatching {
+            startActivity(
+                Intent(this, MainActivity::class.java).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                }
+            )
         }
         val callback = object : Call.Callback() {
             override fun onStateChanged(call: Call, state: Int) {
@@ -207,6 +229,7 @@ private fun CallNoteApp() {
                 hasPermission(context, Manifest.permission.POST_NOTIFICATIONS)
         )
     }
+    var isDefaultDialerState by remember { mutableStateOf(isDefaultDialer(context)) }
 
     val permissionsLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -230,6 +253,13 @@ private fun CallNoteApp() {
         }
     }
 
+    LaunchedEffect(Unit) {
+        while (true) {
+            isDefaultDialerState = isDefaultDialer(context)
+            delay(1000)
+        }
+    }
+
     MaterialTheme(colorScheme = AppColors) {
         Surface(color = Ink) {
             CallNoteHome(
@@ -239,6 +269,7 @@ private fun CallNoteApp() {
                 hasCallPermission = hasCallPermission,
                 hasContactsPermission = hasContactsPermission,
                 hasNotificationPermission = hasNotificationPermission,
+                isDefaultDialer = isDefaultDialerState,
                 requestPermissions = ::requestPermissions
             )
         }
@@ -253,6 +284,7 @@ private fun CallNoteHome(
     hasCallPermission: Boolean,
     hasContactsPermission: Boolean,
     hasNotificationPermission: Boolean,
+    isDefaultDialer: Boolean,
     requestPermissions: () -> Unit
 ) {
     var recorder by remember { mutableStateOf<MediaRecorder?>(null) }
@@ -845,7 +877,7 @@ private fun CallNoteHome(
                     hasPhonePermission = hasPhonePermission,
                     hasContactsPermission = hasContactsPermission,
                     hasNotificationPermission = hasNotificationPermission,
-                    isDefaultDialer = isDefaultDialer(context),
+                    isDefaultDialer = isDefaultDialer,
                     onRequestPermissions = requestPermissions,
                     onRequestDialerIntegration = ::requestDialerIntegration
                 )
