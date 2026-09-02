@@ -834,9 +834,9 @@ private fun CallNoteHome(
                     onSelectedTopic = { selectedTopic = it },
                     onNewTopicText = { newTopicText = it },
                     onAddTopic = ::addTopic,
-                    noteCount = notes.count { noteTopics[it] == selectedTopic },
-                    callCount = callEvents.count { callTopics[it] == selectedTopic },
-                    recordingCount = recordings.count { recordingTopics[it.name] == selectedTopic }
+                    noteCount = if (selectedTopic == "Все темы") notes.size else notes.count { noteTopics[it] == selectedTopic },
+                    callCount = if (selectedTopic == "Все темы") callEvents.size else callEvents.count { callTopics[it] == selectedTopic },
+                    recordingCount = if (selectedTopic == "Все темы") recordings.size else recordings.count { recordingTopics[it.name] == selectedTopic }
                 )
 
                 AppTab.Settings -> SettingsTab(
