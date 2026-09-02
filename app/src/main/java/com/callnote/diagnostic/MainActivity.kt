@@ -16,11 +16,13 @@ import android.os.Environment
 import android.os.ParcelFileDescriptor
 import android.os.Handler
 import android.os.Looper
+import android.provider.ContactsContract
 import android.speech.RecognizerIntent
 import android.speech.RecognitionListener
 import android.speech.SpeechRecognizer
 import android.telephony.TelephonyManager
 import android.telecom.Call
+import android.telecom.CallAudioState
 import android.telecom.InCallService
 import android.telecom.TelecomManager
 import android.provider.Settings
@@ -31,10 +33,10 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -64,6 +66,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -95,6 +98,7 @@ class MainActivity : ComponentActivity() {
 
 private object ActiveCallController {
     var call: Call? = null
+    var service: CallNoteInCallService? = null
 }
 
 internal object CallRecordingState {
@@ -122,9 +126,20 @@ class CallStateReceiver : BroadcastReceiver() {
 class CallNoteInCallService : InCallService() {
     private val callbacks = mutableMapOf<Call, Call.Callback>()
 
+    override fun onCreate() {
+        super.onCreate()
+        ActiveCallController.service = this
+    }
+
     override fun onCallAdded(call: Call) {
         super.onCallAdded(call)
         ActiveCallController.call = call
+        runCatching {
+            val number = call.details.handle?.schemeSpecificPart.orEmpty()
+            if (number.isNotBlank()) {
+                callHistoryFile(this).appendText("${timestampForNote()}|$number\n")
+            }
+        }
         runCatching {
             callEventsFile(this).appendText("${timestampForNote()} - Звонок открыт в CallNote AI\n")
         }
@@ -147,6 +162,19 @@ class CallNoteInCallService : InCallService() {
             callEventsFile(this).appendText("${timestampForNote()} - Звонок закрыт в CallNote AI\n")
         }
         super.onCallRemoved(call)
+    }
+
+    override fun onDestroy() {
+        if (ActiveCallController.service == this) ActiveCallController.service = null
+        super.onDestroy()
+    }
+
+    fun updateMute(muted: Boolean) {
+        runCatching { super.setMuted(muted) }
+    }
+
+    fun updateAudioRoute(route: Int) {
+        runCatching { super.setAudioRoute(route) }
     }
 
     private fun startCallRecording() {
@@ -172,6 +200,7 @@ private fun CallNoteApp() {
     var hasAudioPermission by remember { mutableStateOf(hasPermission(context, Manifest.permission.RECORD_AUDIO)) }
     var hasPhonePermission by remember { mutableStateOf(hasPermission(context, Manifest.permission.READ_PHONE_STATE)) }
     var hasCallPermission by remember { mutableStateOf(hasPermission(context, Manifest.permission.CALL_PHONE)) }
+    var hasContactsPermission by remember { mutableStateOf(hasPermission(context, Manifest.permission.READ_CONTACTS)) }
     var hasNotificationPermission by remember {
         mutableStateOf(
             Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
@@ -185,6 +214,7 @@ private fun CallNoteApp() {
         hasAudioPermission = hasPermission(context, Manifest.permission.RECORD_AUDIO)
         hasPhonePermission = hasPermission(context, Manifest.permission.READ_PHONE_STATE)
         hasCallPermission = hasPermission(context, Manifest.permission.CALL_PHONE)
+        hasContactsPermission = hasPermission(context, Manifest.permission.READ_CONTACTS)
         hasNotificationPermission = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
             hasPermission(context, Manifest.permission.POST_NOTIFICATIONS)
         Toast.makeText(context, "Разрешения обновлены", Toast.LENGTH_SHORT).show()
@@ -195,7 +225,7 @@ private fun CallNoteApp() {
     }
 
     LaunchedEffect(Unit) {
-        if (!hasAudioPermission || !hasPhonePermission || !hasCallPermission || !hasNotificationPermission) {
+        if (!hasAudioPermission || !hasPhonePermission || !hasCallPermission || !hasContactsPermission || !hasNotificationPermission) {
             requestPermissions()
         }
     }
@@ -207,6 +237,7 @@ private fun CallNoteApp() {
                 hasAudioPermission = hasAudioPermission,
                 hasPhonePermission = hasPhonePermission,
                 hasCallPermission = hasCallPermission,
+                hasContactsPermission = hasContactsPermission,
                 hasNotificationPermission = hasNotificationPermission,
                 requestPermissions = ::requestPermissions
             )
@@ -220,6 +251,7 @@ private fun CallNoteHome(
     hasAudioPermission: Boolean,
     hasPhonePermission: Boolean,
     hasCallPermission: Boolean,
+    hasContactsPermission: Boolean,
     hasNotificationPermission: Boolean,
     requestPermissions: () -> Unit
 ) {
@@ -243,6 +275,8 @@ private fun CallNoteHome(
     var aiDraft by remember { mutableStateOf("") }
     var speechText by remember { mutableStateOf("") }
     var transcriptionFile by remember { mutableStateOf<String?>(null) }
+    var selectedTopic by remember { mutableStateOf("Все темы") }
+    var newTopicText by remember { mutableStateOf("") }
     val audioSourceDescriptor = remember { mutableStateOf<ParcelFileDescriptor?>(null) }
     val speechRecognizer = remember(context) {
         if (SpeechRecognizer.isRecognitionAvailable(context)) {
@@ -252,9 +286,17 @@ private fun CallNoteHome(
         }
     }
     val offlineWhisper = remember(context) { OfflineWhisperTranscriber(context) }
+    val russianVosk = remember(context) { RussianVoskTranscriber(context) }
     val recordings = remember { mutableStateListOf<File>() }
     val notes = remember { mutableStateListOf<String>() }
     val callEvents = remember { mutableStateListOf<String>() }
+    val callHistory = remember { mutableStateListOf<PhoneHistoryEntry>() }
+    val contacts = remember { mutableStateListOf<PhoneContact>() }
+    val topics = remember { mutableStateListOf<String>() }
+    val noteTopics = remember { mutableStateMapOf<String, String>() }
+    val recordingTopics = remember { mutableStateMapOf<String, String>() }
+    val callTopics = remember { mutableStateMapOf<String, String>() }
+    var phoneSection by remember { mutableStateOf(PhoneSection.Recent) }
 
     val speechLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -342,10 +384,54 @@ private fun CallNoteHome(
         }
     }
 
+    fun refreshTopics() {
+        topics.clear()
+        topics.addAll(topicsFile(context).takeIf { it.exists() }?.readLines()
+            ?.map { it.trim() }
+            ?.filter { it.isNotBlank() }
+            .orEmpty())
+    }
+
+    fun refreshCallHistory() {
+        callHistory.clear()
+        callHistory.addAll(callHistoryFile(context).takeIf { it.exists() }?.readLines()
+            ?.mapNotNull { line ->
+                val parts = line.split('|', limit = 2)
+                if (parts.size == 2) PhoneHistoryEntry(parts[0], parts[1]) else null
+            }
+            ?.asReversed()
+            .orEmpty())
+    }
+
+    fun refreshContacts() {
+        contacts.clear()
+        if (hasContactsPermission) contacts.addAll(loadContacts(context))
+    }
+
+    fun addTopic() {
+        val name = newTopicText.trim()
+        if (name.isBlank() || topics.any { it.equals(name, ignoreCase = true) }) return
+        topics.add(name)
+        topicsFile(context).appendText(name + "\n")
+        selectedTopic = name
+        newTopicText = ""
+    }
+
+    fun setTopic(map: MutableMap<String, String>, file: File, key: String, topic: String) {
+        if (topic == "Все темы") map.remove(key) else map[key] = topic
+        writeTopicMap(map, file)
+    }
+
     LaunchedEffect(Unit) {
         refreshRecordings()
         refreshNotes()
         refreshCalls()
+        refreshTopics()
+        noteTopics.putAll(readTopicMap(noteTopicsFile(context)))
+        recordingTopics.putAll(readTopicMap(recordingTopicsFile(context)))
+        callTopics.putAll(readTopicMap(callTopicsFile(context)))
+        refreshCallHistory()
+        refreshContacts()
         aiDraft = aiDraftsFile(context).takeIf { it.exists() }?.readText().orEmpty()
     }
 
@@ -395,6 +481,7 @@ private fun CallNoteHome(
             recorder?.release()
             player?.release()
             offlineWhisper.close()
+            russianVosk.close()
         }
     }
 
@@ -493,6 +580,10 @@ private fun CallNoteHome(
         }
         val line = "${timestampForNote()} - $cleanNote"
         notesFile(context).appendText(line + "\n")
+        if (selectedTopic != "Все темы") {
+            noteTopics[line] = selectedTopic
+            writeTopicMap(noteTopics, noteTopicsFile(context))
+        }
         noteText = ""
         status = "Заметка сохранена"
         refreshNotes()
@@ -568,15 +659,14 @@ private fun CallNoteHome(
             val wav = File(context.cacheDir, "${file.nameWithoutExtension}_whisper.wav")
             runCatching {
                 AudioFileConverter.toWhisperWav(file, wav)
-                Handler(Looper.getMainLooper()).post { status = "Whisper расшифровывает запись..." }
-                offlineWhisper.transcribe(
-                    wav,
-                    onUpdate = { message -> Handler(Looper.getMainLooper()).post { status = message } },
-                    onResult = { result -> Handler(Looper.getMainLooper()).post {
-                        speechText = result.trim()
-                        status = if (speechText.isBlank()) "Whisper не нашел речи в записи" else "Расшифровка готова"
-                    } }
-                )
+                Handler(Looper.getMainLooper()).post { status = "Русская модель расшифровывает запись..." }
+                val result = russianVosk.transcribe(wav) { message ->
+                    Handler(Looper.getMainLooper()).post { status = message }
+                }
+                Handler(Looper.getMainLooper()).post {
+                    speechText = result.trim()
+                    status = if (speechText.isBlank()) "Русская модель не нашла речи в записи" else "Расшифровка на русском готова"
+                }
             }.onFailure {
                 Handler(Looper.getMainLooper()).post {
                     status = "Не удалось расшифровать запись: ${it.localizedMessage ?: "проверьте, что в записи есть голос"}"
@@ -585,13 +675,18 @@ private fun CallNoteHome(
         }.start()
     }
 
-    fun saveSpeechAsNote() {
+    fun saveSpeechAsNote(topic: String = selectedTopic) {
         val text = speechText.trim()
         if (text.isBlank()) {
             status = "Сначала распознайте речь"
             return
         }
-        notesFile(context).appendText("${timestampForNote()} - $text\n")
+        val line = "${timestampForNote()} - $text"
+        notesFile(context).appendText(line + "\n")
+        if (topic != "Все темы") {
+            noteTopics[line] = topic
+            writeTopicMap(noteTopics, noteTopicsFile(context))
+        }
         status = "Распознанный текст сохранен"
         refreshNotes()
     }
@@ -640,15 +735,38 @@ private fun CallNoteHome(
                 AppTab.Phone -> PhoneTab(
                     number = dialNumber,
                     callState = callState,
+                    section = phoneSection,
+                    history = callHistory,
+                    contacts = contacts,
+                    onSectionChange = { phoneSection = it },
                     onNumberChanged = { dialNumber = it },
                     onCall = ::placeCall,
                     onAnswer = { ActiveCallController.call?.answer(android.telecom.VideoProfile.STATE_AUDIO_ONLY) },
-                    onHangUp = { ActiveCallController.call?.disconnect() }
+                    onHangUp = { ActiveCallController.call?.disconnect() },
+                    onHoldToggle = { held -> if (held) ActiveCallController.call?.unhold() else ActiveCallController.call?.hold() },
+                    onMuteToggle = { muted -> ActiveCallController.service?.updateMute(muted) },
+                    onSpeakerToggle = { speaker ->
+                        ActiveCallController.service?.updateAudioRoute(
+                            if (speaker) CallAudioState.ROUTE_SPEAKER else CallAudioState.ROUTE_EARPIECE
+                        )
+                    },
+                    onOpenNotes = { selectedTab = AppTab.Notes },
+                    onOpenCalendar = {
+                        runCatching {
+                            context.startActivity(Intent(Intent.ACTION_INSERT).setType("vnd.android.cursor.item/event"))
+                        }.onFailure { status = "Календарь недоступен" }
+                    },
+                    onAddCall = { phoneSection = PhoneSection.Keypad }
                 )
                 AppTab.Recorder -> RecorderTab(
-                    recordings = recordings,
+                    recordings = recordings.filter { selectedTopic == "Все темы" || recordingTopics[it.name] == selectedTopic },
                     isRecording = isRecording,
                     nowPlaying = nowPlaying,
+                    topics = topics,
+                    selectedTopic = selectedTopic,
+                    topicAssignments = recordingTopics,
+                    onTopicChange = { selectedTopic = it },
+                    onAssignTopic = { file, topic -> setTopic(recordingTopics, recordingTopicsFile(context), file.name, topic) },
                     onRecord = { if (isRecording) stopRecording() else startRecording() },
                     onStopPlayer = {
                         stopPlayer()
@@ -669,7 +787,12 @@ private fun CallNoteHome(
                 AppTab.Calls -> CallsTab(
                     isRecording = callRecordingActive,
                     lastAmplitude = lastAmplitude,
-                    callEvents = callEvents,
+                    callEvents = callEvents.filter { selectedTopic == "Все темы" || callTopics[it] == selectedTopic },
+                    topics = topics,
+                    selectedTopic = selectedTopic,
+                    topicAssignments = callTopics,
+                    onTopicChange = { selectedTopic = it },
+                    onAssignTopic = { event, topic -> setTopic(callTopics, callTopicsFile(context), event, topic) },
                     hasPhonePermission = hasPhonePermission,
                     onRefreshCalls = {
                         refreshCalls()
@@ -680,26 +803,47 @@ private fun CallNoteHome(
 
                 AppTab.Notes -> NotesTab(
                     noteText = noteText,
-                    notes = notes,
+                    notes = notes.filter { selectedTopic == "Все темы" || noteTopics[it] == selectedTopic },
+                    topics = topics,
+                    selectedTopic = selectedTopic,
+                    topicAssignments = noteTopics,
+                    onTopicChange = { selectedTopic = it },
+                    onAssignTopic = { note, topic -> setTopic(noteTopics, noteTopicsFile(context), note, topic) },
                     onNoteChanged = { noteText = it },
                     onSaveNote = ::saveNote
                 )
 
                 AppTab.Ai -> AiTab(
-                    recordings = recordings,
-                    notes = notes,
+                    recordings = recordings.filter { selectedTopic == "Все темы" || recordingTopics[it.name] == selectedTopic },
+                    notes = notes.filter { selectedTopic == "Все темы" || noteTopics[it] == selectedTopic },
                     aiDraft = aiDraft,
                     speechText = speechText,
+                    topics = topics,
+                    selectedTopic = selectedTopic,
+                    onTopicChange = { selectedTopic = it },
                     onStartSpeech = ::startSpeechRecognition,
                     onTranscribeRecording = ::transcribeRecording,
-                    onSaveSpeech = ::saveSpeechAsNote,
+                    onSaveSpeech = { saveSpeechAsNote(selectedTopic) },
                     onBuildDraft = ::buildAiDraft
+                )
+
+                AppTab.Topics -> TopicsTab(
+                    topics = topics,
+                    selectedTopic = selectedTopic,
+                    newTopicText = newTopicText,
+                    onSelectedTopic = { selectedTopic = it },
+                    onNewTopicText = { newTopicText = it },
+                    onAddTopic = ::addTopic,
+                    noteCount = notes.count { noteTopics[it] == selectedTopic },
+                    callCount = callEvents.count { callTopics[it] == selectedTopic },
+                    recordingCount = recordings.count { recordingTopics[it.name] == selectedTopic }
                 )
 
                 AppTab.Settings -> SettingsTab(
                     context = context,
                     hasAudioPermission = hasAudioPermission,
                     hasPhonePermission = hasPhonePermission,
+                    hasContactsPermission = hasContactsPermission,
                     hasNotificationPermission = hasNotificationPermission,
                     isDefaultDialer = isDefaultDialer(context),
                     onRequestPermissions = requestPermissions,
@@ -743,34 +887,22 @@ private fun Header() {
 
 @Composable
 private fun TabBar(selectedTab: AppTab, onSelect: (AppTab) -> Unit) {
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        AppTab.entries.chunked(3).forEach { rowTabs ->
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+        AppTab.entries.forEach { tab ->
+            val selected = selectedTab == tab
+            OutlinedButton(
+                onClick = { onSelect(tab) },
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = if (selected) Gold.copy(alpha = 0.18f) else Color.Transparent,
+                    contentColor = if (selected) Gold else SoftText
+                )
             ) {
-                rowTabs.forEach { tab ->
-                    val selected = selectedTab == tab
-                    OutlinedButton(
-                        onClick = { onSelect(tab) },
-                        modifier = Modifier.weight(1f).height(44.dp),
-                        contentPadding = PaddingValues(horizontal = 4.dp),
-                        colors = ButtonDefaults.outlinedButtonColors(
-                            containerColor = if (selected) Gold.copy(alpha = 0.18f) else Color.Transparent,
-                            contentColor = if (selected) Gold else SoftText
-                        )
-                    ) {
-                        Text(
-                            text = tab.title,
-                            fontSize = 13.sp,
-                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                            maxLines = 1
-                        )
-                    }
-                }
+                Text(tab.title, fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
             }
         }
     }
@@ -826,6 +958,11 @@ private fun RecorderTab(
     recordings: List<File>,
     isRecording: Boolean,
     nowPlaying: String?,
+    topics: List<String>,
+    selectedTopic: String,
+    topicAssignments: Map<String, String>,
+    onTopicChange: (String) -> Unit,
+    onAssignTopic: (File, String) -> Unit,
     onRecord: () -> Unit,
     onStopPlayer: () -> Unit,
     onPlay: (File) -> Unit,
@@ -834,6 +971,7 @@ private fun RecorderTab(
     onSeek: (Int) -> Unit,
     onDelete: (File) -> Unit
 ) {
+    TopicPicker(topics = topics, selectedTopic = selectedTopic, onSelect = onTopicChange)
     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         Button(
             onClick = onRecord,
@@ -864,7 +1002,10 @@ private fun RecorderTab(
                 playbackPosition = if (nowPlaying == file.name) playbackPosition else 0,
                 playbackDuration = if (nowPlaying == file.name) playbackDuration else 0,
                 onSeek = onSeek,
-                onDelete = { onDelete(file) }
+                onDelete = { onDelete(file) },
+                topics = topics,
+                currentTopic = topicAssignments[file.name],
+                onTopicChange = { onAssignTopic(file, it) }
             )
         }
     }
@@ -874,43 +1015,227 @@ private fun RecorderTab(
 private fun PhoneTab(
     number: String,
     callState: Int,
+    section: PhoneSection,
+    history: List<PhoneHistoryEntry>,
+    contacts: List<PhoneContact>,
+    onSectionChange: (PhoneSection) -> Unit,
     onNumberChanged: (String) -> Unit,
     onCall: () -> Unit,
     onAnswer: () -> Unit,
-    onHangUp: () -> Unit
+    onHangUp: () -> Unit,
+    onHoldToggle: (Boolean) -> Unit,
+    onMuteToggle: (Boolean) -> Unit,
+    onSpeakerToggle: (Boolean) -> Unit,
+    onOpenNotes: () -> Unit,
+    onOpenCalendar: () -> Unit,
+    onAddCall: () -> Unit
 ) {
     SectionTitle("Телефон")
-    OutlinedTextField(
-        value = number,
-        onValueChange = { onNumberChanged(it.filter { ch -> ch.isDigit() || ch in "+*#" }) },
-        modifier = Modifier.fillMaxWidth(),
-        label = { Text("Номер телефона") },
-        singleLine = true
-    )
-    val keys = listOf("1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "0", "#")
-    keys.chunked(3).forEach { row ->
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            row.forEach { key ->
-                OutlinedButton(
-                    onClick = { onNumberChanged(number + key) },
-                    modifier = Modifier.weight(1f).height(56.dp)
-                ) { Text(key, fontSize = 21.sp) }
-            }
-        }
-    }
     val active = callState == Call.STATE_ACTIVE || callState == Call.STATE_DIALING || callState == Call.STATE_CONNECTING
     val ringing = callState == Call.STATE_RINGING
     if (ringing) {
-        FeaturePanel(title = "Входящий звонок", body = "Ответьте, чтобы начать разговор")
+        FeaturePanel(title = "Входящий звонок", body = number.ifBlank { "Номер скрыт" })
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             Button(onClick = onAnswer, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = Steel)) { Text("Ответить") }
             OutlinedButton(onClick = onHangUp, modifier = Modifier.weight(1f)) { Text("Отклонить") }
         }
     } else if (active) {
-        FeaturePanel(title = "Разговор идет", body = "CallNote AI подключен к звонку")
-        Button(onClick = onHangUp, modifier = Modifier.fillMaxWidth().height(54.dp), colors = ButtonDefaults.buttonColors(containerColor = Wine)) { Text("Завершить звонок") }
+        ActiveCallPanel(
+            number = number,
+            onHangUp = onHangUp,
+            onHoldToggle = onHoldToggle,
+            onMuteToggle = onMuteToggle,
+            onSpeakerToggle = onSpeakerToggle,
+            onOpenNotes = onOpenNotes,
+            onOpenContacts = { onSectionChange(PhoneSection.Contacts) },
+            onOpenCalendar = onOpenCalendar,
+            onAddCall = onAddCall,
+            onOpenKeypad = { onSectionChange(PhoneSection.Keypad) }
+        )
     } else {
-        Button(onClick = onCall, modifier = Modifier.fillMaxWidth().height(56.dp), colors = ButtonDefaults.buttonColors(containerColor = Gold)) { Text("Позвонить", color = Ink, fontWeight = FontWeight.Bold) }
+        PhoneSectionPicker(selected = section, onSelect = onSectionChange)
+        when (section) {
+            PhoneSection.Recent -> {
+                if (history.isEmpty()) EmptyPanel("История звонков появится после первого звонка.")
+                history.take(20).forEach { entry ->
+                    PhoneHistoryRow(entry = entry, onCall = {
+                        onNumberChanged(entry.number)
+                        onCall()
+                    }, onShowNumber = { onNumberChanged(entry.number) })
+                }
+            }
+            PhoneSection.Contacts -> {
+                if (contacts.isEmpty()) EmptyPanel("Разрешите доступ к контактам, чтобы увидеть телефонную книгу.")
+                contacts.forEach { contact ->
+                    ContactRow(contact = contact, onCall = {
+                        onNumberChanged(contact.number)
+                        onCall()
+                    }, onSelect = { onNumberChanged(contact.number) })
+                }
+            }
+            PhoneSection.Favorites -> {
+                val favorites = contacts.take(12)
+                if (favorites.isEmpty()) EmptyPanel("Добавьте контакты в телефонную книгу, чтобы видеть избранное.")
+                favorites.forEach { contact ->
+                    ContactRow(contact = contact, onCall = {
+                        onNumberChanged(contact.number)
+                        onCall()
+                    }, onSelect = { onNumberChanged(contact.number) })
+                }
+            }
+            PhoneSection.Keypad -> DialPad(number = number, onNumberChanged = onNumberChanged, onCall = onCall)
+        }
+    }
+}
+
+@Composable
+private fun PhoneSectionPicker(selected: PhoneSection, onSelect: (PhoneSection) -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        PhoneSection.entries.forEach { item ->
+            OutlinedButton(
+                onClick = { onSelect(item) },
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = if (selected == item) Gold.copy(alpha = 0.18f) else Color.Transparent,
+                    contentColor = if (selected == item) Gold else SoftText
+                )
+            ) {
+                Text(item.title, fontWeight = if (selected == item) FontWeight.Bold else FontWeight.Normal)
+            }
+        }
+    }
+}
+
+@Composable
+private fun DialPad(number: String, onNumberChanged: (String) -> Unit, onCall: () -> Unit) {
+    OutlinedTextField(
+        value = number,
+        onValueChange = { onNumberChanged(it.filter { ch -> ch.isDigit() || ch in "+*#" }) },
+        modifier = Modifier.fillMaxWidth(),
+        label = { Text("Номер телефона") },
+        singleLine = true,
+        trailingIcon = {
+            OutlinedButton(onClick = { onNumberChanged(number.dropLast(1)) }, enabled = number.isNotEmpty()) {
+                Text("⌫")
+            }
+        }
+    )
+    val keys = listOf(
+        "1" to "", "2" to "ABC", "3" to "DEF",
+        "4" to "GHI", "5" to "JKL", "6" to "MNO",
+        "7" to "PQRS", "8" to "TUV", "9" to "WXYZ",
+        "*" to "", "0" to "+", "#" to ""
+    )
+    keys.chunked(3).forEach { row ->
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            row.forEach { (key, letters) ->
+                OutlinedButton(
+                    onClick = { onNumberChanged(number + key) },
+                    modifier = Modifier.weight(1f).height(66.dp)
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(key, fontSize = 22.sp, color = Color.White)
+                        if (letters.isNotEmpty()) Text(letters, fontSize = 10.sp, color = SoftText)
+                    }
+                }
+            }
+        }
+    }
+    Button(
+        onClick = onCall,
+        enabled = number.isNotBlank(),
+        modifier = Modifier.fillMaxWidth().height(56.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = Steel)
+    ) {
+        Text("Позвонить", color = Color.White, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+private fun PhoneHistoryRow(entry: PhoneHistoryEntry, onCall: () -> Unit, onShowNumber: () -> Unit) {
+    Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(entry.number, color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+            Text(entry.timestamp, color = SoftText, fontSize = 13.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = onCall, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = Steel)) { Text("Позвонить") }
+                OutlinedButton(onClick = onShowNumber, modifier = Modifier.weight(1f)) { Text("Набрать") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ContactRow(contact: PhoneContact, onCall: () -> Unit, onSelect: () -> Unit) {
+    Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(contact.name, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            Text(contact.number, color = SoftText, fontSize = 14.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = onCall, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = Steel)) { Text("Позвонить") }
+                OutlinedButton(onClick = onSelect, modifier = Modifier.weight(1f)) { Text("Набрать") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ActiveCallPanel(
+    number: String,
+    onHangUp: () -> Unit,
+    onHoldToggle: (Boolean) -> Unit,
+    onMuteToggle: (Boolean) -> Unit,
+    onSpeakerToggle: (Boolean) -> Unit,
+    onOpenNotes: () -> Unit,
+    onOpenContacts: () -> Unit,
+    onOpenCalendar: () -> Unit,
+    onAddCall: () -> Unit,
+    onOpenKeypad: () -> Unit
+) {
+    var held by remember { mutableStateOf(false) }
+    var muted by remember { mutableStateOf(false) }
+    var speaker by remember { mutableStateOf(false) }
+    FeaturePanel(title = "Разговор идет", body = number.ifBlank { "Текущий звонок" })
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        CallActionButton(if (held) "Продолжить" else "Удержать", Modifier.weight(1f)) {
+            held = !held
+            onHoldToggle(held)
+        }
+        CallActionButton("+ Вызов", Modifier.weight(1f), onAddCall)
+        CallActionButton("Календарь", Modifier.weight(1f), onOpenCalendar)
+    }
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        CallActionButton("Заметки", Modifier.weight(1f), onOpenNotes)
+        CallActionButton(if (muted) "Включить звук" else "Без звука", Modifier.weight(1f)) {
+            muted = !muted
+            onMuteToggle(muted)
+        }
+        CallActionButton("Контакты", Modifier.weight(1f), onOpenContacts)
+    }
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        CallActionButton("Клавиатура", Modifier.weight(1f), onOpenKeypad)
+        CallActionButton(if (speaker) "Динамик вкл." else "Динамик", Modifier.weight(1f)) {
+            speaker = !speaker
+            onSpeakerToggle(speaker)
+        }
+    }
+    Button(
+        onClick = onHangUp,
+        modifier = Modifier.fillMaxWidth().height(58.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = Wine)
+    ) {
+        Text("Завершить звонок", color = Color.White, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+private fun CallActionButton(label: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    OutlinedButton(onClick = onClick, modifier = modifier.height(54.dp)) {
+        Text(label, fontSize = 12.sp, lineHeight = 14.sp)
     }
 }
 
@@ -919,6 +1244,11 @@ private fun CallsTab(
     isRecording: Boolean,
     lastAmplitude: Int,
     callEvents: List<String>,
+    topics: List<String>,
+    selectedTopic: String,
+    topicAssignments: Map<String, String>,
+    onTopicChange: (String) -> Unit,
+    onAssignTopic: (String, String) -> Unit,
     hasPhonePermission: Boolean,
     onRefreshCalls: () -> Unit,
     onRequestPermissions: () -> Unit
@@ -931,6 +1261,8 @@ private fun CallsTab(
     )
 
     DiagnosticsPanel(lastAmplitude = lastAmplitude)
+
+    TopicPicker(topics = topics, selectedTopic = selectedTopic, onSelect = onTopicChange)
 
     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         OutlinedButton(onClick = onRefreshCalls, modifier = Modifier.weight(1f)) {
@@ -945,8 +1277,14 @@ private fun CallsTab(
     if (callEvents.isEmpty()) {
         EmptyPanel("Событий пока нет. Разрешите доступ к состоянию телефона и сделайте тестовый звонок.")
     } else {
-        callEvents.take(8).forEach {
-            Text(it, color = SoftText, fontSize = 14.sp, lineHeight = 19.sp)
+        callEvents.take(8).forEach { event ->
+            FeaturePanel(title = "Событие звонка", body = event)
+            TopicPicker(
+                topics = topics,
+                selectedTopic = selectedTopic,
+                assignedTopic = topicAssignments[event],
+                onSelect = { topic -> onAssignTopic(event, topic) }
+            )
             HorizontalDivider(color = Line)
         }
     }
@@ -956,10 +1294,16 @@ private fun CallsTab(
 private fun NotesTab(
     noteText: String,
     notes: List<String>,
+    topics: List<String>,
+    selectedTopic: String,
+    topicAssignments: Map<String, String>,
+    onTopicChange: (String) -> Unit,
+    onAssignTopic: (String, String) -> Unit,
     onNoteChanged: (String) -> Unit,
     onSaveNote: () -> Unit
 ) {
     SectionTitle("Заметки")
+    TopicPicker(topics = topics, selectedTopic = selectedTopic, onSelect = onTopicChange)
     OutlinedTextField(
         value = noteText,
         onValueChange = onNoteChanged,
@@ -978,8 +1322,14 @@ private fun NotesTab(
     if (notes.isEmpty()) {
         EmptyPanel("Заметок пока нет. Сюда попадут ручные итоги разговоров.")
     } else {
-        notes.take(12).forEach {
-            Text(it, color = SoftText, fontSize = 14.sp, lineHeight = 19.sp)
+        notes.take(12).forEach { note ->
+            FeaturePanel(title = "Заметка", body = note)
+            TopicPicker(
+                topics = topics,
+                selectedTopic = selectedTopic,
+                assignedTopic = topicAssignments[note],
+                onSelect = { topic -> onAssignTopic(note, topic) }
+            )
             HorizontalDivider(color = Line)
         }
     }
@@ -991,12 +1341,16 @@ private fun AiTab(
     notes: List<String>,
     aiDraft: String,
     speechText: String,
+    topics: List<String>,
+    selectedTopic: String,
+    onTopicChange: (String) -> Unit,
     onStartSpeech: () -> Unit,
     onTranscribeRecording: (File) -> Unit,
     onSaveSpeech: () -> Unit,
     onBuildDraft: () -> Unit
 ) {
     SectionTitle("AI-анализ")
+    TopicPicker(topics = topics, selectedTopic = selectedTopic, onSelect = onTopicChange)
     Button(
         onClick = onStartSpeech,
         modifier = Modifier.fillMaxWidth().height(52.dp),
@@ -1036,10 +1390,81 @@ private fun AiTab(
 }
 
 @Composable
+private fun TopicPicker(
+    topics: List<String>,
+    selectedTopic: String,
+    assignedTopic: String? = null,
+    onSelect: (String) -> Unit
+) {
+    val activeTopic = assignedTopic ?: selectedTopic
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        OutlinedButton(
+            onClick = { onSelect("Все темы") },
+            colors = ButtonDefaults.outlinedButtonColors(
+                containerColor = if (activeTopic == "Все темы") Gold.copy(alpha = 0.18f) else Color.Transparent,
+                contentColor = if (activeTopic == "Все темы") Gold else SoftText
+            )
+        ) { Text("Все темы") }
+        topics.forEach { topic ->
+            OutlinedButton(
+                onClick = { onSelect(topic) },
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = if (activeTopic == topic) Gold.copy(alpha = 0.18f) else Color.Transparent,
+                    contentColor = if (activeTopic == topic) Gold else SoftText
+                )
+            ) { Text(topic) }
+        }
+    }
+}
+
+@Composable
+private fun TopicsTab(
+    topics: List<String>,
+    selectedTopic: String,
+    newTopicText: String,
+    onSelectedTopic: (String) -> Unit,
+    onNewTopicText: (String) -> Unit,
+    onAddTopic: () -> Unit,
+    noteCount: Int,
+    callCount: Int,
+    recordingCount: Int
+) {
+    SectionTitle("Темы")
+    OutlinedTextField(
+        value = newTopicText,
+        onValueChange = onNewTopicText,
+        modifier = Modifier.fillMaxWidth(),
+        label = { Text("Название новой темы") },
+        singleLine = true
+    )
+    Button(
+        onClick = onAddTopic,
+        enabled = newTopicText.isNotBlank(),
+        modifier = Modifier.fillMaxWidth().height(52.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = Gold)
+    ) { Text("Создать тему", color = Ink, fontWeight = FontWeight.Bold) }
+    TopicPicker(topics = topics, selectedTopic = selectedTopic, onSelect = onSelectedTopic)
+    if (selectedTopic == "Все темы") {
+        EmptyPanel("Выберите тему, чтобы увидеть связанные заметки, звонки и аудиозаписи.")
+    } else {
+        FeaturePanel(
+            title = selectedTopic,
+            body = "Заметки: $noteCount\nЗвонки: $callCount\nАудиозаписи: $recordingCount"
+        )
+    }
+}
+
+@Composable
 private fun SettingsTab(
     context: Context,
     hasAudioPermission: Boolean,
     hasPhonePermission: Boolean,
+    hasContactsPermission: Boolean,
     hasNotificationPermission: Boolean,
     isDefaultDialer: Boolean,
     onRequestPermissions: () -> Unit,
@@ -1048,6 +1473,7 @@ private fun SettingsTab(
     SectionTitle("Настройки")
     InfoLine("Микрофон", if (hasAudioPermission) "разрешен" else "нужно разрешить")
     InfoLine("Состояние телефона", if (hasPhonePermission) "разрешено" else "нужно разрешить")
+    InfoLine("Контакты", if (hasContactsPermission) "разрешены" else "нужно разрешить")
     InfoLine("Уведомления", if (hasNotificationPermission) "разрешены" else "нужно разрешить")
     InfoLine("Интеграция со звонилкой", if (isDefaultDialer) "CallNote AI выбран как приложение телефона" else "нужно выдать роль приложения телефона")
     InfoLine("Папка записей", recordingsDir(context).absolutePath)
@@ -1108,7 +1534,10 @@ private fun RecordingRow(
     playbackPosition: Int,
     playbackDuration: Int,
     onSeek: (Int) -> Unit,
-    onDelete: () -> Unit
+    onDelete: () -> Unit,
+    topics: List<String>,
+    currentTopic: String?,
+    onTopicChange: (String) -> Unit
 ) {
     Card(
         colors = CardDefaults.cardColors(containerColor = Panel),
@@ -1118,6 +1547,12 @@ private fun RecordingRow(
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text(file.name, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
             Text("${formatFileSize(file.length())} - ${timestampFromFile(file)}", color = SoftText, fontSize = 13.sp)
+            TopicPicker(
+                topics = topics,
+                selectedTopic = currentTopic ?: "Все темы",
+                assignedTopic = currentTopic,
+                onSelect = onTopicChange
+            )
             if (isPlaying && playbackDuration > 0) {
                 Slider(
                     value = playbackPosition.toFloat().coerceIn(0f, playbackDuration.toFloat()),
@@ -1206,7 +1641,8 @@ private fun requiredPermissions(): Array<String> {
         Manifest.permission.RECORD_AUDIO,
         Manifest.permission.READ_PHONE_STATE,
         Manifest.permission.ANSWER_PHONE_CALLS
-        ,Manifest.permission.CALL_PHONE
+        ,Manifest.permission.CALL_PHONE,
+        Manifest.permission.READ_CONTACTS
     )
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         permissions += Manifest.permission.POST_NOTIFICATIONS
@@ -1231,6 +1667,64 @@ private fun notesFile(context: Context): File {
 
 private fun callEventsFile(context: Context): File {
     return File(context.filesDir, "callnote_call_events.txt")
+}
+
+private fun callHistoryFile(context: Context): File {
+    return File(context.filesDir, "callnote_call_history.txt")
+}
+
+private fun topicsFile(context: Context): File {
+    return File(context.filesDir, "callnote_topics.txt")
+}
+
+private fun noteTopicsFile(context: Context): File {
+    return File(context.filesDir, "callnote_note_topics.txt")
+}
+
+private fun recordingTopicsFile(context: Context): File {
+    return File(context.filesDir, "callnote_recording_topics.txt")
+}
+
+private fun callTopicsFile(context: Context): File {
+    return File(context.filesDir, "callnote_call_topics.txt")
+}
+
+private fun readTopicMap(file: File): Map<String, String> {
+    if (!file.exists()) return emptyMap()
+    return file.readLines().mapNotNull { line ->
+        val parts = line.split('\t', limit = 2)
+        if (parts.size == 2 && parts[0].isNotBlank() && parts[1].isNotBlank()) parts[0] to parts[1] else null
+    }.toMap()
+}
+
+private fun writeTopicMap(map: Map<String, String>, file: File) {
+    file.writeText(map.entries.joinToString("\n") { "${it.key.replace("\t", " ")}\t${it.value.replace("\t", " ")}" })
+}
+
+private fun loadContacts(context: Context): List<PhoneContact> {
+    if (!hasPermission(context, Manifest.permission.READ_CONTACTS)) return emptyList()
+    val uri = ContactsContract.CommonDataKinds.Phone.CONTENT_URI
+    val projection = arrayOf(
+        ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+        ContactsContract.CommonDataKinds.Phone.NUMBER
+    )
+    return runCatching {
+        context.contentResolver.query(uri, projection, null, null, "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} ASC")
+            ?.use { cursor ->
+                val nameIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
+                val numberIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
+                buildList {
+                    while (cursor.moveToNext()) {
+                        val name = cursor.getString(nameIndex).orEmpty().trim()
+                        val number = cursor.getString(numberIndex).orEmpty().trim()
+                        if (number.isNotBlank()) add(PhoneContact(name.ifBlank { "Без имени" }, number))
+                    }
+                }
+            }
+            .orEmpty()
+    }.getOrDefault(emptyList())
+        .distinctBy { it.number.filter { char -> char.isDigit() } }
+        .take(100)
 }
 
 private fun aiDraftsFile(context: Context): File {
@@ -1271,8 +1765,20 @@ private enum class AppTab(val title: String) {
     Calls("Звонки"),
     Notes("Заметки"),
     Ai("AI"),
+    Topics("Темы"),
     Settings("Настройки")
 }
+
+private enum class PhoneSection(val title: String) {
+    Recent("Последние"),
+    Contacts("Контакты"),
+    Favorites("Избранное"),
+    Keypad("Клавиатура")
+}
+
+private data class PhoneHistoryEntry(val timestamp: String, val number: String)
+
+private data class PhoneContact(val name: String, val number: String)
 
 private data class RecordingSourceOption(
     val title: String,
