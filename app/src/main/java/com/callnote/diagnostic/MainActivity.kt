@@ -31,10 +31,10 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -743,22 +743,34 @@ private fun Header() {
 
 @Composable
 private fun TabBar(selectedTab: AppTab, onSelect: (AppTab) -> Unit) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        AppTab.entries.forEach { tab ->
-            val selected = selectedTab == tab
-            OutlinedButton(
-                onClick = { onSelect(tab) },
-                colors = ButtonDefaults.outlinedButtonColors(
-                    containerColor = if (selected) Gold.copy(alpha = 0.18f) else Color.Transparent,
-                    contentColor = if (selected) Gold else SoftText
-                )
+        AppTab.entries.chunked(3).forEach { rowTabs ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Text(tab.title, fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
+                rowTabs.forEach { tab ->
+                    val selected = selectedTab == tab
+                    OutlinedButton(
+                        onClick = { onSelect(tab) },
+                        modifier = Modifier.weight(1f).height(44.dp),
+                        contentPadding = PaddingValues(horizontal = 4.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = if (selected) Gold.copy(alpha = 0.18f) else Color.Transparent,
+                            contentColor = if (selected) Gold else SoftText
+                        )
+                    ) {
+                        Text(
+                            text = tab.title,
+                            fontSize = 13.sp,
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                            maxLines = 1
+                        )
+                    }
+                }
             }
         }
     }
