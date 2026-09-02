@@ -24,11 +24,11 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Download Whisper model assets
+      - name: Download Russian offline speech model
         run: |
-          mkdir -p app/src/main/assets
-          curl -L --fail --retry 3 https://raw.githubusercontent.com/vilassn/whisper_android/master/whisper_java/app/src/main/assets/whisper-tiny.tflite -o app/src/main/assets/whisper-tiny.tflite
-          curl -L --fail --retry 3 https://raw.githubusercontent.com/vilassn/whisper_android/master/whisper_java/app/src/main/assets/filters_vocab_multilingual.bin -o app/src/main/assets/filters_vocab_multilingual.bin
+          curl -L --fail --retry 3 \
+            https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip \
+            -o app/src/main/assets/vosk-model-small-ru-0.22.zip
 
       - name: Build APK
         run: |
