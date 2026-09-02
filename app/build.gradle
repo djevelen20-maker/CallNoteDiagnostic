@@ -41,6 +41,7 @@ dependencies {
     implementation 'androidx.compose.material3:material3'
     implementation 'org.tensorflow:tensorflow-lite:2.14.0'
     implementation 'org.tensorflow:tensorflow-lite-support:0.4.4'
+    implementation 'com.alphacephei:vosk-android:0.3.47'
 }
 
 
