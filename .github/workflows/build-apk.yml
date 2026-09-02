@@ -26,6 +26,7 @@ jobs:
 
       - name: Download Russian offline speech model
         run: |
+          mkdir -p app/src/main/assets
           curl -L --fail --retry 3 \
             https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip \
             -o app/src/main/assets/vosk-model-small-ru-0.22.zip
