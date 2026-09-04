@@ -13,13 +13,9 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
-import android.os.ParcelFileDescriptor
 import android.os.Handler
 import android.os.Looper
 import android.provider.ContactsContract
-import android.speech.RecognizerIntent
-import android.speech.RecognitionListener
-import android.speech.SpeechRecognizer
 import android.telephony.TelephonyManager
 import android.telecom.Call
 import android.telecom.CallAudioState
@@ -54,6 +50,8 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Tab
@@ -314,18 +312,13 @@ private fun CallNoteHome(
     var aiDraft by remember { mutableStateOf("") }
     var speechText by remember { mutableStateOf("") }
     var transcriptionFile by remember { mutableStateOf<String?>(null) }
+    var selectedTranscriptionFile by remember { mutableStateOf<File?>(null) }
     var selectedTopic by remember { mutableStateOf("Все темы") }
     var newTopicText by remember { mutableStateOf("") }
-    val audioSourceDescriptor = remember { mutableStateOf<ParcelFileDescriptor?>(null) }
-    val speechRecognizer = remember(context) {
-        if (SpeechRecognizer.isRecognitionAvailable(context)) {
-            SpeechRecognizer.createSpeechRecognizer(context)
-        } else {
-            null
-        }
-    }
-    val offlineWhisper = remember(context) { OfflineWhisperTranscriber(context) }
-    val russianVosk = remember(context) { RussianVoskTranscriber(context) }
+    val settings = remember(context) { context.getSharedPreferences("callnote_settings", Context.MODE_PRIVATE) }
+    var gigaAuthKey by remember(settings) { mutableStateOf(settings.getString("giga_auth_key", "").orEmpty()) }
+    val gigaTranscriber = remember { GigaChatTranscriber() }
+    val russianVosk = remember { RussianVoskTranscriber(context) }
     val recordings = remember { mutableStateListOf<File>() }
     val notes = remember { mutableStateListOf<String>() }
     val callEvents = remember { mutableStateListOf<String>() }
@@ -336,57 +329,6 @@ private fun CallNoteHome(
     val recordingTopics = remember { mutableStateMapOf<String, String>() }
     val callTopics = remember { mutableStateMapOf<String, String>() }
     var phoneSection by remember { mutableStateOf(PhoneSection.Recent) }
-
-    val speechLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        audioSourceDescriptor.value?.close()
-        audioSourceDescriptor.value = null
-        if (result.resultCode == Activity.RESULT_OK) {
-            val matches = result.data
-                ?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
-                .orEmpty()
-            speechText = matches.firstOrNull().orEmpty()
-            status = if (speechText.isBlank()) "Речь не распознана" else {
-                if (transcriptionFile == null) "Речь распознана" else "Аудио расшифровано"
-            }
-        } else {
-            status = "Распознавание отменено"
-        }
-    }
-
-    DisposableEffect(speechRecognizer) {
-        speechRecognizer?.setRecognitionListener(object : RecognitionListener {
-            override fun onReadyForSpeech(params: Bundle?) { status = "Говорите, идет распознавание" }
-            override fun onBeginningOfSpeech() { status = "Слушаю речь" }
-            override fun onRmsChanged(rmsdB: Float) { lastAmplitude = (rmsdB * 100).toInt().coerceAtLeast(0) }
-            override fun onBufferReceived(buffer: ByteArray?) {}
-            override fun onEndOfSpeech() { status = "Обрабатываю речь" }
-            override fun onError(error: Int) {
-                status = when (error) {
-                    SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Нет соединения с сервисом распознавания"
-                    SpeechRecognizer.ERROR_AUDIO -> "Сервис не получил звук с микрофона"
-                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Разрешите микрофон для распознавания"
-                    SpeechRecognizer.ERROR_NO_MATCH -> "Слова не разобраны: говорите громче и ближе к телефону"
-                    SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Распознавание уже занято другим приложением"
-                    else -> "Ошибка распознавания речи: $error"
-                }
-            }
-            override fun onResults(results: Bundle?) {
-                speechText = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    ?.firstOrNull().orEmpty()
-                transcriptionFile = null
-                status = if (speechText.isBlank()) "Речь не распознана" else "Текст получен"
-            }
-            override fun onPartialResults(partialResults: Bundle?) {
-                val partial = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    ?.firstOrNull().orEmpty()
-                if (partial.isNotBlank()) speechText = partial
-            }
-            override fun onEvent(eventType: Int, params: Bundle?) {}
-        })
-        onDispose { speechRecognizer?.destroy() }
-    }
 
     val dialerRoleLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -405,6 +347,9 @@ private fun CallNoteHome(
             ?.filter { it.extension.equals("m4a", ignoreCase = true) }
             ?.sortedByDescending { it.lastModified() }
             .orEmpty())
+        if (selectedTranscriptionFile?.exists() != true) {
+            selectedTranscriptionFile = recordings.firstOrNull()
+        }
     }
 
     fun refreshNotes() {
@@ -476,7 +421,10 @@ private fun CallNoteHome(
 
     LaunchedEffect(Unit) {
         while (true) {
-            callState = ActiveCallController.call?.state ?: Call.STATE_DISCONNECTED
+        callState = ActiveCallController.call?.state ?: Call.STATE_DISCONNECTED
+            ActiveCallController.call?.details?.handle?.schemeSpecificPart
+                ?.takeIf { it.isNotBlank() }
+                ?.let { dialNumber = it }
             callRecordingActive = CallRecordingState.isActive
             delay(500)
         }
@@ -519,7 +467,6 @@ private fun CallNoteHome(
             runCatching { recorder?.stop() }
             recorder?.release()
             player?.release()
-            offlineWhisper.close()
             russianVosk.close()
         }
     }
@@ -628,6 +575,20 @@ private fun CallNoteHome(
         refreshNotes()
     }
 
+    fun deleteNote(note: String) {
+        val file = notesFile(context)
+        if (file.exists()) {
+            val lines = file.readLines().toMutableList()
+            val index = lines.indexOfFirst { it == note }
+            if (index >= 0) lines.removeAt(index)
+            file.writeText(lines.joinToString("\n") + if (lines.isNotEmpty()) "\n" else "")
+        }
+        noteTopics.remove(note)
+        writeTopicMap(noteTopics, noteTopicsFile(context))
+        status = "Заметка удалена"
+        refreshNotes()
+    }
+
     fun buildAiDraft() {
         val latestRecording = recordings.firstOrNull()?.name ?: "запись пока не выбрана"
         val latestNote = speechText.ifBlank { notes.firstOrNull() ?: "заметок пока нет" }
@@ -649,69 +610,72 @@ private fun CallNoteHome(
         status = "AI-черновик подготовлен"
     }
 
-    fun startSpeechRecognition() {
-        if (!hasAudioPermission) {
-            requestPermissions()
-            status = "Разрешите микрофон для распознавания речи"
-            return
-        }
-
-        if (isRecording) {
-            stopRecording()
-            status = "Запись сохранена. Теперь говорите для расшифровки"
-        }
-        speechRecognizer?.cancel()
-        speechText = ""
-        transcriptionFile = null
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
-            putExtra(RecognizerIntent.EXTRA_PROMPT, "Говорите, CallNote AI слушает")
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-        }
-
-        runCatching {
-            if (speechRecognizer == null) {
-                status = "На телефоне нет голосового сервиса. Установите или включите Google Voice Input"
-                Toast.makeText(context, status, Toast.LENGTH_LONG).show()
-            } else {
-                speechRecognizer.startListening(intent)
-                Toast.makeText(context, "Говорите, идет распознавание", Toast.LENGTH_SHORT).show()
-            }
-        }.onFailure {
-            status = "Не удалось запустить распознавание: ${it.localizedMessage ?: "проверьте микрофон"}"
-            Toast.makeText(context, status, Toast.LENGTH_LONG).show()
-        }
-    }
-
     fun transcribeRecording(file: File) {
-        if (!hasAudioPermission) {
-            requestPermissions()
-            status = "Разрешите доступ к микрофону для расшифровки"
-            return
-        }
+        selectedTranscriptionFile = file
+        val authKey = gigaAuthKey
         transcriptionFile = file.name
         speechText = ""
-        status = "Подготовка аудио для Whisper..."
+        val useGiga = authKey.isNotBlank()
+        status = if (useGiga) "Подготовка записи для GigaChat..." else "Подготовка русской офлайн-расшифровки..."
         Thread {
-            val wav = File(context.cacheDir, "${file.nameWithoutExtension}_whisper.wav")
+            val wavFile = File.createTempFile("callnote-transcribe-", ".wav", context.cacheDir)
             runCatching {
-                AudioFileConverter.toWhisperWav(file, wav)
-                Handler(Looper.getMainLooper()).post { status = "Русская модель расшифровывает запись..." }
-                val result = russianVosk.transcribe(wav) { message ->
-                    Handler(Looper.getMainLooper()).post { status = message }
+                val result = if (useGiga) {
+                    gigaTranscriber.transcribe(file, authKey) { message ->
+                        Handler(Looper.getMainLooper()).post { status = message }
+                    }
+                } else {
+                    Handler(Looper.getMainLooper()).post { status = "Конвертирую аудио для офлайн-распознавания..." }
+                    AudioFileConverter.toWhisperWav(file, wavFile)
+                    russianVosk.transcribe(wavFile) { message ->
+                        Handler(Looper.getMainLooper()).post { status = message }
+                    }
                 }
                 Handler(Looper.getMainLooper()).post {
                     speechText = result.trim()
-                    status = if (speechText.isBlank()) "Русская модель не нашла речи в записи" else "Расшифровка на русском готова"
+                    status = if (speechText.isBlank()) {
+                        "Речь не найдена: проверьте громкость записи"
+                    } else if (useGiga) {
+                        "Расшифровка GigaChat готова"
+                    } else {
+                        "Офлайн-расшифровка готова"
+                    }
                 }
             }.onFailure {
                 Handler(Looper.getMainLooper()).post {
-                    status = "Не удалось расшифровать запись: ${it.localizedMessage ?: "проверьте, что в записи есть голос"}"
+                    status = if (useGiga) {
+                        "Ошибка GigaChat: ${it.localizedMessage ?: "проверьте ключ и интернет"}"
+                    } else {
+                        "Ошибка офлайн-распознавания: ${it.localizedMessage ?: "проверьте аудиофайл"}"
+                    }
                 }
             }
+            wavFile.delete()
         }.start()
+    }
+
+    fun toggleCallRecording() {
+        if (!hasAudioPermission) {
+            requestPermissions()
+            status = "Разрешите микрофон для записи разговора"
+            return
+        }
+        if (callRecordingActive) {
+            context.startService(Intent(context, CallRecordingService::class.java).setAction(CallRecordingService.ACTION_STOP))
+            callRecordingActive = false
+            status = "Запись разговора остановлена"
+        } else {
+            runCatching {
+                ContextCompat.startForegroundService(
+                    context,
+                    Intent(context, CallRecordingService::class.java).setAction(CallRecordingService.ACTION_START)
+                )
+                callRecordingActive = true
+                status = "Запись разговора включена"
+            }.onFailure {
+                status = "Не удалось включить запись разговора: ${it.localizedMessage ?: "проверьте разрешения"}"
+            }
+        }
     }
 
     fun saveSpeechAsNote(topic: String = selectedTopic) {
@@ -777,9 +741,11 @@ private fun CallNoteHome(
                     section = phoneSection,
                     history = callHistory,
                     contacts = contacts,
+                    isCallRecording = callRecordingActive,
                     onSectionChange = { phoneSection = it },
                     onNumberChanged = { dialNumber = it },
                     onCall = ::placeCall,
+                    onToggleCallRecording = ::toggleCallRecording,
                     onAnswer = { ActiveCallController.call?.answer(android.telecom.VideoProfile.STATE_AUDIO_ONLY) },
                     onHangUp = { ActiveCallController.call?.disconnect() },
                     onHoldToggle = { held -> if (held) ActiveCallController.call?.unhold() else ActiveCallController.call?.hold() },
@@ -849,7 +815,8 @@ private fun CallNoteHome(
                     onTopicChange = { selectedTopic = it },
                     onAssignTopic = { note, topic -> setTopic(noteTopics, noteTopicsFile(context), note, topic) },
                     onNoteChanged = { noteText = it },
-                    onSaveNote = ::saveNote
+                    onSaveNote = ::saveNote,
+                    onDeleteNote = ::deleteNote
                 )
 
                 AppTab.Ai -> AiTab(
@@ -857,10 +824,12 @@ private fun CallNoteHome(
                     notes = notes.filter { selectedTopic == "Все темы" || noteTopics[it] == selectedTopic },
                     aiDraft = aiDraft,
                     speechText = speechText,
+                    selectedRecording = selectedTranscriptionFile,
+                    gigaAuthKey = gigaAuthKey,
                     topics = topics,
                     selectedTopic = selectedTopic,
                     onTopicChange = { selectedTopic = it },
-                    onStartSpeech = ::startSpeechRecognition,
+                    onRecordingSelected = { selectedTranscriptionFile = it },
                     onTranscribeRecording = ::transcribeRecording,
                     onSaveSpeech = { saveSpeechAsNote(selectedTopic) },
                     onBuildDraft = ::buildAiDraft
@@ -885,8 +854,13 @@ private fun CallNoteHome(
                     hasContactsPermission = hasContactsPermission,
                     hasNotificationPermission = hasNotificationPermission,
                     isDefaultDialer = isDefaultDialer,
+                    gigaAuthKey = gigaAuthKey,
                     onRequestPermissions = requestPermissions,
-                    onRequestDialerIntegration = ::requestDialerIntegration
+                    onRequestDialerIntegration = ::requestDialerIntegration,
+                    onGigaAuthKeyChange = {
+                        gigaAuthKey = it
+                        settings.edit().putString("giga_auth_key", it).apply()
+                    }
                 )
             }
 
@@ -1057,9 +1031,11 @@ private fun PhoneTab(
     section: PhoneSection,
     history: List<PhoneHistoryEntry>,
     contacts: List<PhoneContact>,
+    isCallRecording: Boolean,
     onSectionChange: (PhoneSection) -> Unit,
     onNumberChanged: (String) -> Unit,
     onCall: () -> Unit,
+    onToggleCallRecording: () -> Unit,
     onAnswer: () -> Unit,
     onHangUp: () -> Unit,
     onHoldToggle: (Boolean) -> Unit,
@@ -1083,7 +1059,9 @@ private fun PhoneTab(
     } else if (active) {
         ActiveCallPanel(
             number = number,
+            isRecording = isCallRecording,
             onHangUp = onHangUp,
+            onToggleRecording = onToggleCallRecording,
             onHoldToggle = onHoldToggle,
             onMuteToggle = onMuteToggle,
             onSpeakerToggle = onSpeakerToggle,
@@ -1324,7 +1302,9 @@ private fun ContactAvatar(label: String) {
 @Composable
 private fun ActiveCallPanel(
     number: String,
+    isRecording: Boolean,
     onHangUp: () -> Unit,
+    onToggleRecording: () -> Unit,
     onHoldToggle: (Boolean) -> Unit,
     onMuteToggle: (Boolean) -> Unit,
     onSpeakerToggle: (Boolean) -> Unit,
@@ -1338,6 +1318,17 @@ private fun ActiveCallPanel(
     var muted by remember { mutableStateOf(false) }
     var speaker by remember { mutableStateOf(false) }
     FeaturePanel(title = "Разговор идет", body = number.ifBlank { "Текущий звонок" })
+    Button(
+        onClick = onToggleRecording,
+        modifier = Modifier.fillMaxWidth().height(50.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = if (isRecording) Wine else Gold)
+    ) {
+        Text(
+            if (isRecording) "Остановить запись разговора" else "Записать разговор",
+            color = Ink,
+            fontWeight = FontWeight.Bold
+        )
+    }
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         CallActionButton(if (held) "Продолжить" else "Удержать", Modifier.weight(1f)) {
             held = !held
@@ -1438,7 +1429,8 @@ private fun NotesTab(
     onTopicChange: (String) -> Unit,
     onAssignTopic: (String, String) -> Unit,
     onNoteChanged: (String) -> Unit,
-    onSaveNote: () -> Unit
+    onSaveNote: () -> Unit,
+    onDeleteNote: (String) -> Unit
 ) {
     SectionTitle("Заметки")
     TopicPicker(topics = topics, selectedTopic = selectedTopic, onSelect = onTopicChange)
@@ -1462,6 +1454,12 @@ private fun NotesTab(
     } else {
         notes.take(12).forEach { note ->
             FeaturePanel(title = "Заметка", body = note)
+            OutlinedButton(
+                onClick = { onDeleteNote(note) },
+                modifier = Modifier.fillMaxWidth().height(46.dp)
+            ) {
+                Text("Удалить заметку")
+            }
             TopicPicker(
                 topics = topics,
                 selectedTopic = selectedTopic,
@@ -1479,41 +1477,77 @@ private fun AiTab(
     notes: List<String>,
     aiDraft: String,
     speechText: String,
+    selectedRecording: File?,
+    gigaAuthKey: String,
     topics: List<String>,
     selectedTopic: String,
     onTopicChange: (String) -> Unit,
-    onStartSpeech: () -> Unit,
+    onRecordingSelected: (File) -> Unit,
     onTranscribeRecording: (File) -> Unit,
     onSaveSpeech: () -> Unit,
     onBuildDraft: () -> Unit
 ) {
-    SectionTitle("AI-анализ")
+    var menuExpanded by remember { mutableStateOf(false) }
+    val currentRecording = selectedRecording?.takeIf { selected -> recordings.any { it.path == selected.path } }
+        ?: recordings.firstOrNull()
+
+    SectionTitle("Транскрибация")
     TopicPicker(topics = topics, selectedTopic = selectedTopic, onSelect = onTopicChange)
-    Button(
-        onClick = onStartSpeech,
-        modifier = Modifier.fillMaxWidth().height(52.dp),
-        colors = ButtonDefaults.buttonColors(containerColor = Gold)
-    ) {
-        Text("Распознать речь", color = Ink, fontWeight = FontWeight.Bold)
+
+    Box(modifier = Modifier.fillMaxWidth()) {
+        OutlinedButton(
+            onClick = { menuExpanded = true },
+            modifier = Modifier.fillMaxWidth(),
+            enabled = recordings.isNotEmpty()
+        ) {
+            Text(currentRecording?.name ?: "Выберите запись", maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        DropdownMenu(
+            expanded = menuExpanded,
+            onDismissRequest = { menuExpanded = false }
+        ) {
+            recordings.take(30).forEach { file ->
+                DropdownMenuItem(
+                    text = { Text(file.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                    onClick = {
+                        onRecordingSelected(file)
+                        menuExpanded = false
+                    }
+                )
+            }
+        }
     }
+
+    InfoLine(
+        "Режим распознавания",
+        if (gigaAuthKey.isBlank()) "Русский офлайн, без ключа и интернета" else "GigaChat по ключу API"
+    )
+    if (currentRecording == null) {
+        EmptyPanel("Сначала сделайте запись в разделе «Диктофон» или завершите звонок.")
+    } else {
+        Button(
+            onClick = { onTranscribeRecording(currentRecording) },
+            modifier = Modifier.fillMaxWidth().height(52.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = Gold)
+        ) {
+            Text(
+                if (gigaAuthKey.isBlank()) "Расшифровать офлайн" else "Расшифровать через GigaChat",
+                color = Ink,
+                fontWeight = FontWeight.Bold
+            )
+        }
+    }
+
     if (speechText.isNotBlank()) {
-        FeaturePanel(title = "Распознанный текст", body = speechText)
+        FeaturePanel(title = "Расшифрованный текст", body = speechText)
         OutlinedButton(
             onClick = onSaveSpeech,
             modifier = Modifier.fillMaxWidth().height(50.dp)
         ) {
-            Text("Сохранить в заметки")
+            Text("Сохранить текст в заметки")
         }
     }
-    InfoLine("Последняя запись", recordings.firstOrNull()?.name ?: "нет записей")
-    recordings.firstOrNull()?.let { file ->
-        OutlinedButton(
-            onClick = { onTranscribeRecording(file) },
-            modifier = Modifier.fillMaxWidth().height(50.dp)
-        ) {
-            Text("Расшифровать последнюю запись")
-        }
-    }
+
     InfoLine("Последняя заметка", notes.firstOrNull() ?: "нет заметок")
     Button(
         onClick = onBuildDraft,
@@ -1605,8 +1639,10 @@ private fun SettingsTab(
     hasContactsPermission: Boolean,
     hasNotificationPermission: Boolean,
     isDefaultDialer: Boolean,
+    gigaAuthKey: String,
     onRequestPermissions: () -> Unit,
-    onRequestDialerIntegration: () -> Unit
+    onRequestDialerIntegration: () -> Unit,
+    onGigaAuthKeyChange: (String) -> Unit
 ) {
     SectionTitle("Настройки")
     InfoLine("Микрофон", if (hasAudioPermission) "разрешен" else "нужно разрешить")
@@ -1615,6 +1651,35 @@ private fun SettingsTab(
     InfoLine("Уведомления", if (hasNotificationPermission) "разрешены" else "нужно разрешить")
     InfoLine("Интеграция со звонилкой", if (isDefaultDialer) "CallNote AI выбран как приложение телефона" else "нужно выдать роль приложения телефона")
     InfoLine("Папка записей", recordingsDir(context).absolutePath)
+
+    SectionTitle("GigaChat")
+    OutlinedTextField(
+        value = gigaAuthKey,
+        onValueChange = onGigaAuthKeyChange,
+        modifier = Modifier.fillMaxWidth(),
+        label = { Text("Ключ авторизации GigaChat") },
+        placeholder = { Text("Вставьте ключ API") },
+        singleLine = true,
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedTextColor = Color.White,
+            unfocusedTextColor = Color.White,
+            focusedContainerColor = Panel,
+            unfocusedContainerColor = Panel,
+            focusedBorderColor = Gold,
+            unfocusedBorderColor = Line,
+            focusedLabelColor = Gold,
+            unfocusedLabelColor = SoftText,
+            focusedPlaceholderColor = SoftText,
+            unfocusedPlaceholderColor = SoftText,
+            cursorColor = Gold
+        )
+    )
+    Text(
+        "Без ключа работает русская офлайн-расшифровка. Ключ GigaChat включает облачный режим.",
+        color = SoftText,
+        fontSize = 13.sp,
+        modifier = Modifier.padding(top = 6.dp)
+    )
 
     Button(
         onClick = onRequestPermissions,
