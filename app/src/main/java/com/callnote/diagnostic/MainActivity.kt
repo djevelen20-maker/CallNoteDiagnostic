@@ -33,6 +33,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -43,6 +44,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
@@ -52,6 +54,10 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -78,6 +84,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -1065,6 +1072,8 @@ private fun PhoneTab(
     SectionTitle("Телефон")
     val active = callState == Call.STATE_ACTIVE || callState == Call.STATE_DIALING || callState == Call.STATE_CONNECTING
     val ringing = callState == Call.STATE_RINGING
+    var searchQuery by remember { mutableStateOf("") }
+
     if (ringing) {
         FeaturePanel(title = "Входящий звонок", body = number.ifBlank { "Номер скрыт" })
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -1085,20 +1094,35 @@ private fun PhoneTab(
             onOpenKeypad = { onSectionChange(PhoneSection.Keypad) }
         )
     } else {
+        PhoneSearchField(query = searchQuery, onQueryChange = { searchQuery = it })
         PhoneSectionPicker(selected = section, onSelect = onSectionChange)
+        val query = searchQuery.trim()
+        val visibleContacts = contacts.filter { contact ->
+            query.isBlank() || contact.name.contains(query, ignoreCase = true) || contact.number.contains(query, ignoreCase = true)
+        }
+        val visibleHistory = history.filter { entry ->
+            val contactName = contacts.firstOrNull { samePhoneNumber(it.number, entry.number) }?.name.orEmpty()
+            query.isBlank() || entry.number.contains(query, ignoreCase = true) || contactName.contains(query, ignoreCase = true)
+        }
+
         when (section) {
             PhoneSection.Recent -> {
-                if (history.isEmpty()) EmptyPanel("История звонков появится после первого звонка.")
-                history.take(20).forEach { entry ->
-                    PhoneHistoryRow(entry = entry, onCall = {
+                if (visibleHistory.isEmpty()) {
+                    EmptyPanel(if (query.isBlank()) "История звонков появится после первого звонка." else "Ничего не найдено")
+                }
+                visibleHistory.take(20).forEach { entry ->
+                    PhoneHistoryRow(entry = entry, displayName = contacts.firstOrNull { samePhoneNumber(it.number, entry.number) }?.name,
+                        onCall = {
                         onNumberChanged(entry.number)
                         onCall()
                     }, onShowNumber = { onNumberChanged(entry.number) })
                 }
             }
             PhoneSection.Contacts -> {
-                if (contacts.isEmpty()) EmptyPanel("Разрешите доступ к контактам, чтобы увидеть телефонную книгу.")
-                contacts.forEach { contact ->
+                if (visibleContacts.isEmpty()) {
+                    EmptyPanel(if (contacts.isEmpty()) "Разрешите доступ к контактам, чтобы увидеть телефонную книгу." else "Ничего не найдено")
+                }
+                visibleContacts.forEach { contact ->
                     ContactRow(contact = contact, onCall = {
                         onNumberChanged(contact.number)
                         onCall()
@@ -1106,8 +1130,8 @@ private fun PhoneTab(
                 }
             }
             PhoneSection.Favorites -> {
-                val favorites = contacts.take(12)
-                if (favorites.isEmpty()) EmptyPanel("Добавьте контакты в телефонную книгу, чтобы видеть избранное.")
+                val favorites = visibleContacts.take(12)
+                if (favorites.isEmpty()) EmptyPanel(if (query.isBlank()) "Избранные контакты появятся после выдачи доступа к телефонной книге." else "Ничего не найдено")
                 favorites.forEach { contact ->
                     ContactRow(contact = contact, onCall = {
                         onNumberChanged(contact.number)
@@ -1122,24 +1146,58 @@ private fun PhoneTab(
 
 @Composable
 private fun PhoneSectionPicker(selected: PhoneSection, onSelect: (PhoneSection) -> Unit) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    TabRow(
+        selectedTabIndex = PhoneSection.entries.indexOf(selected),
+        containerColor = Color.Transparent,
+        contentColor = Gold,
+        divider = { HorizontalDivider(color = Line) }
     ) {
         PhoneSection.entries.forEach { item ->
-            OutlinedButton(
+            Tab(
+                selected = selected == item,
                 onClick = { onSelect(item) },
-                colors = ButtonDefaults.outlinedButtonColors(
-                    containerColor = if (selected == item) Gold.copy(alpha = 0.18f) else Color.Transparent,
-                    contentColor = if (selected == item) Gold else SoftText
-                )
-            ) {
-                Text(item.title, fontWeight = if (selected == item) FontWeight.Bold else FontWeight.Normal)
-            }
+                text = {
+                    Text(
+                        item.title,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        fontSize = 12.sp,
+                        fontWeight = if (selected == item) FontWeight.Bold else FontWeight.Normal
+                    )
+                }
+            )
         }
     }
+}
+
+@Composable
+private fun PhoneSearchField(query: String, onQueryChange: (String) -> Unit) {
+    OutlinedTextField(
+        value = query,
+        onValueChange = onQueryChange,
+        modifier = Modifier.fillMaxWidth(),
+        placeholder = { Text("Поиск контакта или номера") },
+        leadingIcon = { Text("⌕", color = SoftText, fontSize = 23.sp) },
+        trailingIcon = {
+            if (query.isNotEmpty()) {
+                IconButton(onClick = { onQueryChange("") }) {
+                    Text("×", color = SoftText, fontSize = 22.sp)
+                }
+            }
+        },
+        singleLine = true,
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedTextColor = Color.White,
+            unfocusedTextColor = Color.White,
+            focusedContainerColor = Panel,
+            unfocusedContainerColor = Panel,
+            focusedBorderColor = Gold,
+            unfocusedBorderColor = Line,
+            focusedPlaceholderColor = SoftText,
+            unfocusedPlaceholderColor = SoftText,
+            cursorColor = Gold
+        )
+    )
 }
 
 @Composable
@@ -1188,30 +1246,78 @@ private fun DialPad(number: String, onNumberChanged: (String) -> Unit, onCall: (
 }
 
 @Composable
-private fun PhoneHistoryRow(entry: PhoneHistoryEntry, onCall: () -> Unit, onShowNumber: () -> Unit) {
-    Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(entry.number, color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold)
-            Text(entry.timestamp, color = SoftText, fontSize = 13.sp)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = onCall, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = Steel)) { Text("Позвонить") }
-                OutlinedButton(onClick = onShowNumber, modifier = Modifier.weight(1f)) { Text("Набрать") }
+private fun PhoneHistoryRow(
+    entry: PhoneHistoryEntry,
+    displayName: String?,
+    onCall: () -> Unit,
+    onShowNumber: () -> Unit
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onShowNumber)
+                .padding(vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            ContactAvatar(displayName ?: entry.number)
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(displayName ?: entry.number, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (displayName != null) Text(entry.number, color = SoftText, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(entry.timestamp, color = SoftText, fontSize = 12.sp)
+            }
+            Button(
+                onClick = onCall,
+                modifier = Modifier.height(40.dp),
+                contentPadding = PaddingValues(horizontal = 11.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Steel)
+            ) {
+                Text("Вызов", fontSize = 12.sp, color = Color.White)
             }
         }
+        HorizontalDivider(color = Line)
     }
 }
 
 @Composable
 private fun ContactRow(contact: PhoneContact, onCall: () -> Unit, onSelect: () -> Unit) {
-    Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(contact.name, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-            Text(contact.number, color = SoftText, fontSize = 14.sp)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = onCall, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = Steel)) { Text("Позвонить") }
-                OutlinedButton(onClick = onSelect, modifier = Modifier.weight(1f)) { Text("Набрать") }
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onSelect)
+                .padding(vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            ContactAvatar(contact.name)
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(contact.name, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(contact.number, color = SoftText, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            Button(
+                onClick = onCall,
+                modifier = Modifier.height(40.dp),
+                contentPadding = PaddingValues(horizontal = 11.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Steel)
+            ) {
+                Text("Вызов", fontSize = 12.sp, color = Color.White)
             }
         }
+        HorizontalDivider(color = Line)
+    }
+}
+
+@Composable
+private fun ContactAvatar(label: String) {
+    Box(
+        modifier = Modifier
+            .size(44.dp)
+            .background(Steel.copy(alpha = 0.9f), RoundedCornerShape(22.dp)),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(contactInitials(label), color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
     }
 }
 
@@ -1811,6 +1917,21 @@ private enum class PhoneSection(val title: String) {
 private data class PhoneHistoryEntry(val timestamp: String, val number: String)
 
 private data class PhoneContact(val name: String, val number: String)
+
+private fun samePhoneNumber(first: String, second: String): Boolean {
+    val firstDigits = first.filter { it.isDigit() }.takeLast(10)
+    val secondDigits = second.filter { it.isDigit() }.takeLast(10)
+    return firstDigits.isNotBlank() && firstDigits == secondDigits
+}
+
+private fun contactInitials(label: String): String {
+    val words = label.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+    return when {
+        words.size >= 2 -> "${words[0].first()}${words[1].first()}".uppercase(Locale.getDefault())
+        words.size == 1 -> words[0].take(2).uppercase(Locale.getDefault())
+        else -> "?"
+    }
+}
 
 private data class RecordingSourceOption(
     val title: String,
