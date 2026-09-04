@@ -17,7 +17,7 @@ class RussianVoskTranscriber(private val context: Context) {
         val loadedModel = synchronized(lock) {
             model ?: loadModel(onUpdate).also { model = it }
         }
-        onUpdate("Русская модель обрабатывает аудио...")
+        onUpdate("Офлайн-модель обрабатывает аудио...")
         val recognizer = Recognizer(loadedModel, 16_000.0f)
         try {
             FileInputStream(wavFile).use { input ->
@@ -35,8 +35,7 @@ class RussianVoskTranscriber(private val context: Context) {
                     recognizer.acceptWaveForm(buffer, count)
                 }
             }
-            val json = JSONObject(recognizer.finalResult)
-            return json.optString("text").trim()
+            return JSONObject(recognizer.finalResult).optString("text").trim()
         } finally {
             recognizer.close()
         }
@@ -53,7 +52,7 @@ class RussianVoskTranscriber(private val context: Context) {
         val modelDir = File(context.filesDir, MODEL_DIR)
         val marker = File(modelDir, ".ready")
         if (!marker.exists()) {
-            onUpdate("Подготавливаю русскую модель распознавания...")
+            onUpdate("Подготавливаю русскую офлайн-модель...")
             if (modelDir.exists()) modelDir.deleteRecursively()
             modelDir.mkdirs()
             context.assets.open(MODEL_ZIP).use { input ->
@@ -61,16 +60,13 @@ class RussianVoskTranscriber(private val context: Context) {
                     var entry = zip.nextEntry
                     while (entry != null) {
                         val cleanName = entry.name.replace('\\', '/').removePrefix("/")
-                        if (cleanName.contains("..")) {
-                            entry = zip.nextEntry
-                            continue
-                        }
-                        val target = File(modelDir, cleanName.substringAfter('/', cleanName))
-                        if (entry.isDirectory) {
-                            target.mkdirs()
-                        } else {
-                            target.parentFile?.mkdirs()
-                            FileOutputStream(target).use { output -> zip.copyTo(output) }
+                        if (!cleanName.contains("..")) {
+                            val target = File(modelDir, cleanName.substringAfter('/', cleanName))
+                            if (entry.isDirectory) target.mkdirs()
+                            else {
+                                target.parentFile?.mkdirs()
+                                FileOutputStream(target).use { output -> zip.copyTo(output) }
+                            }
                         }
                         zip.closeEntry()
                         entry = zip.nextEntry
