@@ -317,7 +317,9 @@ private fun CallNoteHome(
     var newTopicText by remember { mutableStateOf("") }
     val settings = remember(context) { context.getSharedPreferences("callnote_settings", Context.MODE_PRIVATE) }
     var gigaAuthKey by remember(settings) { mutableStateOf(settings.getString("giga_auth_key", "").orEmpty()) }
+    var googleSpeechApiKey by remember(settings) { mutableStateOf(settings.getString("google_speech_api_key", "").orEmpty()) }
     val gigaTranscriber = remember { GigaChatTranscriber() }
+    val googleSpeechTranscriber = remember { GoogleSpeechTranscriber() }
     val russianVosk = remember { RussianVoskTranscriber(context) }
     val recordings = remember { mutableStateListOf<File>() }
     val notes = remember { mutableStateListOf<String>() }
@@ -612,29 +614,45 @@ private fun CallNoteHome(
 
     fun transcribeRecording(file: File) {
         selectedTranscriptionFile = file
-        val authKey = gigaAuthKey
+        val gigaKey = gigaAuthKey
+        val googleKey = googleSpeechApiKey
         transcriptionFile = file.name
         speechText = ""
-        val useGiga = authKey.isNotBlank()
-        status = if (useGiga) "Подготовка записи для GigaChat..." else "Подготовка русской офлайн-расшифровки..."
+        val useGoogle = googleKey.isNotBlank()
+        val useGiga = !useGoogle && gigaKey.isNotBlank()
+        status = when {
+            useGoogle -> "Подготовка записи для Google Speech-to-Text..."
+            useGiga -> "Подготовка записи для GigaChat..."
+            else -> "Подготовка русской офлайн-расшифровки..."
+        }
         Thread {
             val wavFile = File.createTempFile("callnote-transcribe-", ".wav", context.cacheDir)
             runCatching {
-                val result = if (useGiga) {
-                    gigaTranscriber.transcribe(file, authKey) { message ->
+                val result = when {
+                    useGoogle -> {
+                        Handler(Looper.getMainLooper()).post { status = "Конвертирую аудио для Google Speech..." }
+                        AudioFileConverter.toWhisperWav(file, wavFile)
+                        googleSpeechTranscriber.transcribe(wavFile, googleKey) { message ->
+                            Handler(Looper.getMainLooper()).post { status = message }
+                        }
+                    }
+                    useGiga -> gigaTranscriber.transcribe(file, gigaKey) { message ->
                         Handler(Looper.getMainLooper()).post { status = message }
                     }
-                } else {
-                    Handler(Looper.getMainLooper()).post { status = "Конвертирую аудио для офлайн-распознавания..." }
-                    AudioFileConverter.toWhisperWav(file, wavFile)
-                    russianVosk.transcribe(wavFile) { message ->
-                        Handler(Looper.getMainLooper()).post { status = message }
+                    else -> {
+                        Handler(Looper.getMainLooper()).post { status = "Конвертирую аудио для офлайн-распознавания..." }
+                        AudioFileConverter.toWhisperWav(file, wavFile)
+                        russianVosk.transcribe(wavFile) { message ->
+                            Handler(Looper.getMainLooper()).post { status = message }
+                        }
                     }
                 }
                 Handler(Looper.getMainLooper()).post {
                     speechText = result.trim()
                     status = if (speechText.isBlank()) {
                         "Речь не найдена: проверьте громкость записи"
+                    } else if (useGoogle) {
+                        "Расшифровка Google Speech-to-Text готова"
                     } else if (useGiga) {
                         "Расшифровка GigaChat готова"
                     } else {
@@ -643,7 +661,9 @@ private fun CallNoteHome(
                 }
             }.onFailure {
                 Handler(Looper.getMainLooper()).post {
-                    status = if (useGiga) {
+                    status = if (useGoogle) {
+                        "Ошибка Google Speech-to-Text: ${it.localizedMessage ?: "проверьте ключ и интернет"}"
+                    } else if (useGiga) {
                         "Ошибка GigaChat: ${it.localizedMessage ?: "проверьте ключ и интернет"}"
                     } else {
                         "Ошибка офлайн-распознавания: ${it.localizedMessage ?: "проверьте аудиофайл"}"
@@ -826,6 +846,7 @@ private fun CallNoteHome(
                     speechText = speechText,
                     selectedRecording = selectedTranscriptionFile,
                     gigaAuthKey = gigaAuthKey,
+                    googleSpeechApiKey = googleSpeechApiKey,
                     topics = topics,
                     selectedTopic = selectedTopic,
                     onTopicChange = { selectedTopic = it },
@@ -855,11 +876,16 @@ private fun CallNoteHome(
                     hasNotificationPermission = hasNotificationPermission,
                     isDefaultDialer = isDefaultDialer,
                     gigaAuthKey = gigaAuthKey,
+                    googleSpeechApiKey = googleSpeechApiKey,
                     onRequestPermissions = requestPermissions,
                     onRequestDialerIntegration = ::requestDialerIntegration,
                     onGigaAuthKeyChange = {
                         gigaAuthKey = it
                         settings.edit().putString("giga_auth_key", it).apply()
+                    },
+                    onGoogleSpeechApiKeyChange = {
+                        googleSpeechApiKey = it
+                        settings.edit().putString("google_speech_api_key", it).apply()
                     }
                 )
             }
@@ -1479,6 +1505,7 @@ private fun AiTab(
     speechText: String,
     selectedRecording: File?,
     gigaAuthKey: String,
+    googleSpeechApiKey: String,
     topics: List<String>,
     selectedTopic: String,
     onTopicChange: (String) -> Unit,
@@ -1520,7 +1547,11 @@ private fun AiTab(
 
     InfoLine(
         "Режим распознавания",
-        if (gigaAuthKey.isBlank()) "Русский офлайн, без ключа и интернета" else "GigaChat по ключу API"
+        when {
+            googleSpeechApiKey.isNotBlank() -> "Google Speech-to-Text по ключу API"
+            gigaAuthKey.isNotBlank() -> "GigaChat по ключу API"
+            else -> "Русский офлайн, без ключа и интернета"
+        }
     )
     if (currentRecording == null) {
         EmptyPanel("Сначала сделайте запись в разделе «Диктофон» или завершите звонок.")
@@ -1531,7 +1562,11 @@ private fun AiTab(
             colors = ButtonDefaults.buttonColors(containerColor = Gold)
         ) {
             Text(
-                if (gigaAuthKey.isBlank()) "Расшифровать офлайн" else "Расшифровать через GigaChat",
+                when {
+                    googleSpeechApiKey.isNotBlank() -> "Расшифровать через Google Speech-to-Text"
+                    gigaAuthKey.isNotBlank() -> "Расшифровать через GigaChat"
+                    else -> "Расшифровать офлайн"
+                },
                 color = Ink,
                 fontWeight = FontWeight.Bold
             )
@@ -1640,9 +1675,11 @@ private fun SettingsTab(
     hasNotificationPermission: Boolean,
     isDefaultDialer: Boolean,
     gigaAuthKey: String,
+    googleSpeechApiKey: String,
     onRequestPermissions: () -> Unit,
     onRequestDialerIntegration: () -> Unit,
-    onGigaAuthKeyChange: (String) -> Unit
+    onGigaAuthKeyChange: (String) -> Unit,
+    onGoogleSpeechApiKeyChange: (String) -> Unit
 ) {
     SectionTitle("Настройки")
     InfoLine("Микрофон", if (hasAudioPermission) "разрешен" else "нужно разрешить")
@@ -1676,6 +1713,35 @@ private fun SettingsTab(
     )
     Text(
         "Без ключа работает русская офлайн-расшифровка. Ключ GigaChat включает облачный режим.",
+        color = SoftText,
+        fontSize = 13.sp,
+        modifier = Modifier.padding(top = 6.dp)
+    )
+
+    SectionTitle("Google Speech-to-Text")
+    OutlinedTextField(
+        value = googleSpeechApiKey,
+        onValueChange = onGoogleSpeechApiKeyChange,
+        modifier = Modifier.fillMaxWidth(),
+        label = { Text("Ключ Google Cloud Speech-to-Text") },
+        placeholder = { Text("Вставьте ключ API, если он есть") },
+        singleLine = true,
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedTextColor = Color.White,
+            unfocusedTextColor = Color.White,
+            focusedContainerColor = Panel,
+            unfocusedContainerColor = Panel,
+            focusedBorderColor = Gold,
+            unfocusedBorderColor = Line,
+            focusedLabelColor = Gold,
+            unfocusedLabelColor = SoftText,
+            focusedPlaceholderColor = SoftText,
+            unfocusedPlaceholderColor = SoftText,
+            cursorColor = Gold
+        )
+    )
+    Text(
+        "Google Cloud расшифровывает выбранный WAV-файл через интернет. Без ключа продолжает работать офлайн-режим.",
         color = SoftText,
         fontSize = 13.sp,
         modifier = Modifier.padding(top = 6.dp)
