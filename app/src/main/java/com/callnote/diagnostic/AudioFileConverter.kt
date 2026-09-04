@@ -26,6 +26,7 @@ object AudioFileConverter {
             val mime = format.getString(MediaFormat.KEY_MIME) ?: error("Неизвестный аудиоформат")
             val sourceRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
             val channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+            require(channels > 0) { "Некорректное число каналов" }
             val decoder = MediaCodec.createDecoderByType(mime)
             extractor.selectTrack(track)
             decoder.configure(format, null, null, 0)
@@ -66,6 +67,7 @@ object AudioFileConverter {
             }
             decoder.stop()
             decoder.release()
+
             val source = pcm.toByteArray().toShortArray()
             val mono = FloatArray(source.size / channels)
             for (i in mono.indices) {
