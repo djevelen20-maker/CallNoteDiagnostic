@@ -16,6 +16,9 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.ContactsContract
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.telephony.TelephonyManager
 import android.telecom.Call
 import android.telecom.CallAudioState
@@ -300,6 +303,7 @@ private fun CallNoteHome(
     var nowPlaying by remember { mutableStateOf<String?>(null) }
     var playbackPosition by remember { mutableIntStateOf(0) }
     var playbackDuration by remember { mutableIntStateOf(0) }
+    var recognizePlayback by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("Готов к записи, заметкам и проверке звонка") }
     var noteText by remember { mutableStateOf("") }
     // A manual dictation must use the microphone. Call-only sources are often silent
@@ -309,18 +313,32 @@ private fun CallNoteHome(
     var dialNumber by remember { mutableStateOf((context as? Activity)?.intent?.data?.schemeSpecificPart.orEmpty()) }
     var callState by remember { mutableIntStateOf(Call.STATE_DISCONNECTED) }
     var callRecordingActive by remember { mutableStateOf(CallRecordingState.isActive) }
+    var speechRecognizerListening by remember { mutableStateOf(false) }
+    var speechRecognitionEnabled by remember { mutableStateOf(false) }
     var aiDraft by remember { mutableStateOf("") }
     var speechText by remember { mutableStateOf("") }
     var transcriptionFile by remember { mutableStateOf<String?>(null) }
     var selectedTranscriptionFile by remember { mutableStateOf<File?>(null) }
     var selectedTopic by remember { mutableStateOf("Все темы") }
     var newTopicText by remember { mutableStateOf("") }
-    val settings = remember(context) { context.getSharedPreferences("callnote_settings", Context.MODE_PRIVATE) }
-    var gigaAuthKey by remember(settings) { mutableStateOf(settings.getString("giga_auth_key", "").orEmpty()) }
-    var googleSpeechApiKey by remember(settings) { mutableStateOf(settings.getString("google_speech_api_key", "").orEmpty()) }
-    val gigaTranscriber = remember { GigaChatTranscriber() }
-    val googleSpeechTranscriber = remember { GoogleSpeechTranscriber() }
     val russianVosk = remember { RussianVoskTranscriber(context) }
+    val googleSpeechRecognizer = remember(context) {
+        if (SpeechRecognizer.isRecognitionAvailable(context)) {
+            SpeechRecognizer.createSpeechRecognizer(context)
+        } else {
+            null
+        }
+    }
+    val googleSpeechIntent = remember {
+        Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "ru-RU")
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
+        }
+    }
     val recordings = remember { mutableStateListOf<File>() }
     val notes = remember { mutableStateListOf<String>() }
     val callEvents = remember { mutableStateListOf<String>() }
@@ -432,6 +450,110 @@ private fun CallNoteHome(
         }
     }
 
+    fun startGoogleSpeech() {
+        if (!hasAudioPermission) {
+            requestPermissions()
+            status = "Разрешите микрофон для Google Speech"
+            return
+        }
+        val recognizer = googleSpeechRecognizer
+        if (recognizer == null) {
+            status = "На телефоне нет доступного Google SpeechRecognizer"
+            return
+        }
+        if (speechRecognizerListening) return
+        runCatching {
+            speechRecognizerListening = true
+            status = if (callRecordingActive) {
+                "Google Speech слушает микрофон во время записи звонка..."
+            } else {
+                "Google Speech слушает по-русски..."
+            }
+            recognizer.startListening(googleSpeechIntent)
+        }.onFailure {
+            speechRecognizerListening = false
+            status = "Google Speech не запустился: ${it.localizedMessage ?: "проверьте сервис распознавания"}"
+        }
+    }
+
+    fun scheduleSpeechRestart() {
+        if (speechRecognitionEnabled && (callRecordingActive || isRecording || recognizePlayback)) {
+            Handler(Looper.getMainLooper()).postDelayed({
+                if (speechRecognitionEnabled && (callRecordingActive || isRecording || recognizePlayback)) {
+                    startGoogleSpeech()
+                }
+            }, 350)
+        }
+    }
+
+    DisposableEffect(googleSpeechRecognizer) {
+        val recognizer = googleSpeechRecognizer
+        if (recognizer == null) {
+            onDispose { }
+        } else {
+            recognizer.setRecognitionListener(object : RecognitionListener {
+                override fun onReadyForSpeech(params: Bundle?) {
+                    status = if (callRecordingActive) {
+                        "Google Speech слушает микрофон во время записи звонка..."
+                    } else {
+                        "Google Speech слушает по-русски..."
+                    }
+                }
+
+                override fun onBeginningOfSpeech() {
+                    status = if (callRecordingActive) {
+                        "Запись звонка идет, Google распознает речь микрофона..."
+                    } else {
+                        "Говорите, идет распознавание Google Speech..."
+                    }
+                }
+
+                override fun onRmsChanged(rmsdB: Float) = Unit
+                override fun onBufferReceived(buffer: ByteArray?) = Unit
+                override fun onEndOfSpeech() {
+                    speechRecognizerListening = false
+                    status = "Обрабатываю речь Google Speech..."
+                    scheduleSpeechRestart()
+                }
+
+                override fun onError(error: Int) {
+                    speechRecognizerListening = false
+                    status = when (error) {
+                        SpeechRecognizer.ERROR_NETWORK,
+                        SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Google Speech недоступен: проверьте интернет"
+                        SpeechRecognizer.ERROR_NO_MATCH -> "Google Speech не разобрал фразу"
+                        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Разрешите микрофон для Google Speech"
+                        else -> "Google Speech: ошибка распознавания ($error)"
+                    }
+                    scheduleSpeechRestart()
+                }
+
+                override fun onResults(results: Bundle?) {
+                    speechRecognizerListening = false
+                    results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        ?.firstOrNull()
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { speechText = it }
+                    status = if (speechText.isBlank()) "Google Speech не вернул текст" else "Google Speech готов"
+                    scheduleSpeechRestart()
+                }
+
+                override fun onPartialResults(partialResults: Bundle?) {
+                    partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        ?.firstOrNull()
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { speechText = it }
+                }
+
+                override fun onEvent(eventType: Int, params: Bundle?) = Unit
+            })
+            onDispose {
+                recognizer.cancel()
+                recognizer.destroy()
+            }
+        }
+    }
+
     fun placeCall() {
         val number = dialNumber.filter { it.isDigit() || it == '+' || it == '*' || it == '#' }
         if (number.isBlank()) return
@@ -444,6 +566,33 @@ private fun CallNoteHome(
                 ?.placeCall(Uri.parse("tel:${Uri.encode(number)}"), Bundle())
             callState = Call.STATE_DIALING
         }.onFailure { status = "Не удалось начать звонок: ${it.localizedMessage ?: "проверьте телефонные разрешения"}" }
+    }
+
+    fun toggleGoogleSpeech() {
+        if (speechRecognizerListening) {
+            speechRecognitionEnabled = false
+            googleSpeechRecognizer?.stopListening()
+            speechRecognizerListening = false
+            status = "Google Speech остановлен"
+        } else {
+            speechText = ""
+            speechRecognitionEnabled = true
+            startGoogleSpeech()
+        }
+    }
+
+    LaunchedEffect(callRecordingActive) {
+        if (callRecordingActive) {
+            speechRecognitionEnabled = true
+            delay(350)
+            startGoogleSpeech()
+        } else {
+            speechRecognitionEnabled = false
+            if (speechRecognizerListening) {
+                googleSpeechRecognizer?.stopListening()
+                speechRecognizerListening = false
+            }
+        }
     }
 
     LaunchedEffect(isRecording) {
@@ -474,6 +623,11 @@ private fun CallNoteHome(
     }
 
     fun stopPlayer() {
+        if (recognizePlayback) {
+            googleSpeechRecognizer?.stopListening()
+            speechRecognizerListening = false
+            recognizePlayback = false
+        }
         player?.release()
         player = null
         nowPlaying = null
@@ -482,6 +636,11 @@ private fun CallNoteHome(
     }
 
     fun stopRecording() {
+        if (speechRecognizerListening && !callRecordingActive) {
+            speechRecognitionEnabled = false
+            googleSpeechRecognizer?.stopListening()
+            speechRecognizerListening = false
+        }
         runCatching {
             recorder?.stop()
         }
@@ -533,6 +692,29 @@ private fun CallNoteHome(
         }
     }
 
+    fun toggleRecordingAndSpeech() {
+        if (callRecordingActive) {
+            toggleGoogleSpeech()
+            return
+        }
+        if (isRecording || speechRecognizerListening) {
+            speechRecognitionEnabled = false
+            if (speechRecognizerListening) {
+                googleSpeechRecognizer?.stopListening()
+                speechRecognizerListening = false
+            }
+            if (isRecording) stopRecording()
+            status = "Запись и распознавание остановлены"
+        } else {
+            speechText = ""
+            speechRecognitionEnabled = true
+            startRecording()
+            Handler(Looper.getMainLooper()).postDelayed({
+                if (isRecording) startGoogleSpeech()
+            }, 350)
+        }
+    }
+
     fun playRecording(file: File) {
         stopPlayer()
         runCatching {
@@ -545,7 +727,14 @@ private fun CallNoteHome(
                     nowPlaying = null
                     playbackPosition = 0
                     playbackDuration = 0
-                    status = "Прослушивание завершено"
+                    if (recognizePlayback) {
+                        googleSpeechRecognizer?.stopListening()
+                        speechRecognizerListening = false
+                        recognizePlayback = false
+                        status = "Проигрывание и распознавание завершены"
+                    } else {
+                        status = "Прослушивание завершено"
+                    }
                 }
                 start()
             }
@@ -558,6 +747,16 @@ private fun CallNoteHome(
         }.onFailure {
             status = "Не удалось воспроизвести запись"
         }
+    }
+
+    fun playAndRecognizeRecording(file: File) {
+        speechText = ""
+        playRecording(file)
+        recognizePlayback = true
+        speechRecognitionEnabled = true
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (recognizePlayback && nowPlaying == file.name) startGoogleSpeech()
+        }, 350)
     }
 
     fun saveNote() {
@@ -614,60 +813,28 @@ private fun CallNoteHome(
 
     fun transcribeRecording(file: File) {
         selectedTranscriptionFile = file
-        val gigaKey = gigaAuthKey
-        val googleKey = googleSpeechApiKey
         transcriptionFile = file.name
         speechText = ""
-        val useGoogle = googleKey.isNotBlank()
-        val useGiga = !useGoogle && gigaKey.isNotBlank()
-        status = when {
-            useGoogle -> "Подготовка записи для Google Speech-to-Text..."
-            useGiga -> "Подготовка записи для GigaChat..."
-            else -> "Подготовка русской офлайн-расшифровки..."
-        }
+        status = "Подготовка русской офлайн-расшифровки..."
         Thread {
             val wavFile = File.createTempFile("callnote-transcribe-", ".wav", context.cacheDir)
             runCatching {
-                val result = when {
-                    useGoogle -> {
-                        Handler(Looper.getMainLooper()).post { status = "Конвертирую аудио для Google Speech..." }
-                        AudioFileConverter.toWhisperWav(file, wavFile)
-                        googleSpeechTranscriber.transcribe(wavFile, googleKey) { message ->
-                            Handler(Looper.getMainLooper()).post { status = message }
-                        }
-                    }
-                    useGiga -> gigaTranscriber.transcribe(file, gigaKey) { message ->
-                        Handler(Looper.getMainLooper()).post { status = message }
-                    }
-                    else -> {
-                        Handler(Looper.getMainLooper()).post { status = "Конвертирую аудио для офлайн-распознавания..." }
-                        AudioFileConverter.toWhisperWav(file, wavFile)
-                        russianVosk.transcribe(wavFile) { message ->
-                            Handler(Looper.getMainLooper()).post { status = message }
-                        }
-                    }
+                Handler(Looper.getMainLooper()).post { status = "Конвертирую аудио для офлайн-распознавания..." }
+                AudioFileConverter.toWhisperWav(file, wavFile)
+                val result = russianVosk.transcribe(wavFile) { message ->
+                    Handler(Looper.getMainLooper()).post { status = message }
                 }
                 Handler(Looper.getMainLooper()).post {
                     speechText = result.trim()
                     status = if (speechText.isBlank()) {
                         "Речь не найдена: проверьте громкость записи"
-                    } else if (useGoogle) {
-                        "Расшифровка Google Speech-to-Text готова"
-                    } else if (useGiga) {
-                        "Расшифровка GigaChat готова"
                     } else {
                         "Офлайн-расшифровка готова"
                     }
                 }
             }.onFailure {
                 Handler(Looper.getMainLooper()).post {
-                    status = if (useGoogle) {
-                        "Ошибка Google Speech-to-Text: ${it.localizedMessage ?: "проверьте ключ и интернет"}"
-                    } else if (useGiga) {
-                        "Ошибка GigaChat: ${it.localizedMessage ?: "проверьте ключ и интернет"}"
-                    } else {
-                        "Ошибка офлайн-распознавания: ${it.localizedMessage ?: "проверьте аудиофайл"}"
-                    }
+                    status = "Ошибка офлайн-распознавания: ${it.localizedMessage ?: "проверьте аудиофайл"}"
                 }
             }
             wavFile.delete()
@@ -691,6 +858,7 @@ private fun CallNoteHome(
                     Intent(context, CallRecordingService::class.java).setAction(CallRecordingService.ACTION_START)
                 )
                 callRecordingActive = true
+                speechText = ""
                 status = "Запись разговора включена"
             }.onFailure {
                 status = "Не удалось включить запись разговора: ${it.localizedMessage ?: "проверьте разрешения"}"
@@ -798,6 +966,7 @@ private fun CallNoteHome(
                         status = "Воспроизведение остановлено"
                     },
                     onPlay = ::playRecording,
+                    onPlayAndRecognize = ::playAndRecognizeRecording,
                     playbackPosition = playbackPosition,
                     playbackDuration = playbackDuration,
                     onSeek = { position -> player?.seekTo(position) },
@@ -845,12 +1014,14 @@ private fun CallNoteHome(
                     aiDraft = aiDraft,
                     speechText = speechText,
                     selectedRecording = selectedTranscriptionFile,
-                    gigaAuthKey = gigaAuthKey,
-                    googleSpeechApiKey = googleSpeechApiKey,
+                    speechRecognizerListening = speechRecognizerListening,
+                    isRecording = isRecording,
+                    isCallRecording = callRecordingActive,
                     topics = topics,
                     selectedTopic = selectedTopic,
                     onTopicChange = { selectedTopic = it },
                     onRecordingSelected = { selectedTranscriptionFile = it },
+                    onToggleRecordingAndSpeech = ::toggleRecordingAndSpeech,
                     onTranscribeRecording = ::transcribeRecording,
                     onSaveSpeech = { saveSpeechAsNote(selectedTopic) },
                     onBuildDraft = ::buildAiDraft
@@ -875,18 +1046,8 @@ private fun CallNoteHome(
                     hasContactsPermission = hasContactsPermission,
                     hasNotificationPermission = hasNotificationPermission,
                     isDefaultDialer = isDefaultDialer,
-                    gigaAuthKey = gigaAuthKey,
-                    googleSpeechApiKey = googleSpeechApiKey,
                     onRequestPermissions = requestPermissions,
-                    onRequestDialerIntegration = ::requestDialerIntegration,
-                    onGigaAuthKeyChange = {
-                        gigaAuthKey = it
-                        settings.edit().putString("giga_auth_key", it).apply()
-                    },
-                    onGoogleSpeechApiKeyChange = {
-                        googleSpeechApiKey = it
-                        settings.edit().putString("google_speech_api_key", it).apply()
-                    }
+                    onRequestDialerIntegration = ::requestDialerIntegration
                 )
             }
 
@@ -1005,6 +1166,7 @@ private fun RecorderTab(
     onRecord: () -> Unit,
     onStopPlayer: () -> Unit,
     onPlay: (File) -> Unit,
+    onPlayAndRecognize: (File) -> Unit,
     playbackPosition: Int,
     playbackDuration: Int,
     onSeek: (Int) -> Unit,
@@ -1038,6 +1200,7 @@ private fun RecorderTab(
                 file = file,
                 isPlaying = nowPlaying == file.name,
                 onPlay = { onPlay(file) },
+                onPlayAndRecognize = { onPlayAndRecognize(file) },
                 playbackPosition = if (nowPlaying == file.name) playbackPosition else 0,
                 playbackDuration = if (nowPlaying == file.name) playbackDuration else 0,
                 onSeek = onSeek,
@@ -1504,12 +1667,14 @@ private fun AiTab(
     aiDraft: String,
     speechText: String,
     selectedRecording: File?,
-    gigaAuthKey: String,
-    googleSpeechApiKey: String,
+    speechRecognizerListening: Boolean,
+    isRecording: Boolean,
+    isCallRecording: Boolean,
     topics: List<String>,
     selectedTopic: String,
     onTopicChange: (String) -> Unit,
     onRecordingSelected: (File) -> Unit,
+    onToggleRecordingAndSpeech: () -> Unit,
     onTranscribeRecording: (File) -> Unit,
     onSaveSpeech: () -> Unit,
     onBuildDraft: () -> Unit
@@ -1520,6 +1685,32 @@ private fun AiTab(
 
     SectionTitle("Транскрибация")
     TopicPicker(topics = topics, selectedTopic = selectedTopic, onSelect = onTopicChange)
+
+    Button(
+        onClick = onToggleRecordingAndSpeech,
+        modifier = Modifier.fillMaxWidth().height(52.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = if (speechRecognizerListening) Wine else Steel)
+    ) {
+        Text(
+            when {
+                isCallRecording && speechRecognizerListening -> "Остановить распознавание звонка"
+                isCallRecording -> "Распознавать речь звонка"
+                isRecording || speechRecognizerListening -> "Остановить запись и распознавание"
+                else -> "Записать и распознать речь"
+            },
+            color = Color.White,
+            fontWeight = FontWeight.Bold
+        )
+    }
+    InfoLine(
+        "Google SpeechRecognizer",
+        when {
+            isCallRecording && speechRecognizerListening -> "слушает микрофон во время записи звонка"
+            isCallRecording -> "запись звонка включена"
+            speechRecognizerListening -> "слушает микрофон и пишет текст"
+            else -> "готов, API-ключ не нужен"
+        }
+    )
 
     Box(modifier = Modifier.fillMaxWidth()) {
         OutlinedButton(
@@ -1545,14 +1736,7 @@ private fun AiTab(
         }
     }
 
-    InfoLine(
-        "Режим распознавания",
-        when {
-            googleSpeechApiKey.isNotBlank() -> "Google Speech-to-Text по ключу API"
-            gigaAuthKey.isNotBlank() -> "GigaChat по ключу API"
-            else -> "Русский офлайн, без ключа и интернета"
-        }
-    )
+    InfoLine("Расшифровка записи", "русская офлайн-модель Vosk")
     if (currentRecording == null) {
         EmptyPanel("Сначала сделайте запись в разделе «Диктофон» или завершите звонок.")
     } else {
@@ -1562,11 +1746,7 @@ private fun AiTab(
             colors = ButtonDefaults.buttonColors(containerColor = Gold)
         ) {
             Text(
-                when {
-                    googleSpeechApiKey.isNotBlank() -> "Расшифровать через Google Speech-to-Text"
-                    gigaAuthKey.isNotBlank() -> "Расшифровать через GigaChat"
-                    else -> "Расшифровать офлайн"
-                },
+                "Расшифровать офлайн",
                 color = Ink,
                 fontWeight = FontWeight.Bold
             )
@@ -1674,12 +1854,8 @@ private fun SettingsTab(
     hasContactsPermission: Boolean,
     hasNotificationPermission: Boolean,
     isDefaultDialer: Boolean,
-    gigaAuthKey: String,
-    googleSpeechApiKey: String,
     onRequestPermissions: () -> Unit,
-    onRequestDialerIntegration: () -> Unit,
-    onGigaAuthKeyChange: (String) -> Unit,
-    onGoogleSpeechApiKeyChange: (String) -> Unit
+    onRequestDialerIntegration: () -> Unit
 ) {
     SectionTitle("Настройки")
     InfoLine("Микрофон", if (hasAudioPermission) "разрешен" else "нужно разрешить")
@@ -1688,64 +1864,6 @@ private fun SettingsTab(
     InfoLine("Уведомления", if (hasNotificationPermission) "разрешены" else "нужно разрешить")
     InfoLine("Интеграция со звонилкой", if (isDefaultDialer) "CallNote AI выбран как приложение телефона" else "нужно выдать роль приложения телефона")
     InfoLine("Папка записей", recordingsDir(context).absolutePath)
-
-    SectionTitle("GigaChat")
-    OutlinedTextField(
-        value = gigaAuthKey,
-        onValueChange = onGigaAuthKeyChange,
-        modifier = Modifier.fillMaxWidth(),
-        label = { Text("Ключ авторизации GigaChat") },
-        placeholder = { Text("Вставьте ключ API") },
-        singleLine = true,
-        colors = OutlinedTextFieldDefaults.colors(
-            focusedTextColor = Color.White,
-            unfocusedTextColor = Color.White,
-            focusedContainerColor = Panel,
-            unfocusedContainerColor = Panel,
-            focusedBorderColor = Gold,
-            unfocusedBorderColor = Line,
-            focusedLabelColor = Gold,
-            unfocusedLabelColor = SoftText,
-            focusedPlaceholderColor = SoftText,
-            unfocusedPlaceholderColor = SoftText,
-            cursorColor = Gold
-        )
-    )
-    Text(
-        "Без ключа работает русская офлайн-расшифровка. Ключ GigaChat включает облачный режим.",
-        color = SoftText,
-        fontSize = 13.sp,
-        modifier = Modifier.padding(top = 6.dp)
-    )
-
-    SectionTitle("Google Speech-to-Text")
-    OutlinedTextField(
-        value = googleSpeechApiKey,
-        onValueChange = onGoogleSpeechApiKeyChange,
-        modifier = Modifier.fillMaxWidth(),
-        label = { Text("Ключ Google Cloud Speech-to-Text") },
-        placeholder = { Text("Вставьте ключ API, если он есть") },
-        singleLine = true,
-        colors = OutlinedTextFieldDefaults.colors(
-            focusedTextColor = Color.White,
-            unfocusedTextColor = Color.White,
-            focusedContainerColor = Panel,
-            unfocusedContainerColor = Panel,
-            focusedBorderColor = Gold,
-            unfocusedBorderColor = Line,
-            focusedLabelColor = Gold,
-            unfocusedLabelColor = SoftText,
-            focusedPlaceholderColor = SoftText,
-            unfocusedPlaceholderColor = SoftText,
-            cursorColor = Gold
-        )
-    )
-    Text(
-        "Google Cloud расшифровывает выбранный WAV-файл через интернет. Без ключа продолжает работать офлайн-режим.",
-        color = SoftText,
-        fontSize = 13.sp,
-        modifier = Modifier.padding(top = 6.dp)
-    )
 
     Button(
         onClick = onRequestPermissions,
@@ -1800,6 +1918,7 @@ private fun RecordingRow(
     file: File,
     isPlaying: Boolean,
     onPlay: () -> Unit,
+    onPlayAndRecognize: () -> Unit,
     playbackPosition: Int,
     playbackDuration: Int,
     onSeek: (Int) -> Unit,
@@ -1842,6 +1961,12 @@ private fun RecordingRow(
                 OutlinedButton(onClick = onDelete, modifier = Modifier.weight(1f)) {
                     Text("Удалить")
                 }
+            }
+            OutlinedButton(
+                onClick = onPlayAndRecognize,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Распознать при проигрывании")
             }
         }
     }
