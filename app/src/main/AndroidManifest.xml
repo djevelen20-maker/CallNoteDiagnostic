@@ -20,7 +20,6 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.CAPTURE_AUDIO_OUTPUT" />
-    <uses-permission android:name="android.permission.INTERNET" />
 
     <application
         android:theme="@style/AppTheme"
